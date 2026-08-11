@@ -1,5 +1,11 @@
 export { CbmClient, serializeArgs } from "./cbm/client.js";
-export type { CbmArgs, CbmCommandResult, CbmClientOptions } from "./cbm/types.js";
+export {
+  CliCbmTransport,
+  FallbackCbmTransport,
+  PersistentCbmTransport,
+  createDefaultTransport
+} from "./cbm/transport.js";
+export type { CbmArgs, CbmCommandResult, CbmClientOptions, CbmTransport } from "./cbm/types.js";
 export { findExecutable } from "./cbm/paths.js";
 export { loadConfig } from "./config.js";
 export type { SydesConfig } from "./config.js";

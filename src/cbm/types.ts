@@ -10,10 +10,22 @@ export interface CbmCommandResult<T = unknown> {
   stdout: string;
   stderr: string;
   parsed: T | null;
+  elapsedMs?: number;
+  transport?: string;
 }
 
 export interface CbmClientOptions {
   bin?: string;
   cwd?: string;
   env?: NodeJS.ProcessEnv;
+  transport?: CbmTransport;
+  preferPersistent?: boolean;
+  requestTimeoutMs?: number;
+}
+
+export interface CbmTransport {
+  readonly kind: string;
+  readonly processStartCount: number;
+  callTool<T = unknown>(tool: string, args?: CbmArgs): Promise<CbmCommandResult<T>>;
+  close(): Promise<void> | void;
 }

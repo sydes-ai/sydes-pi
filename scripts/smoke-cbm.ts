@@ -42,45 +42,51 @@ async function main(): Promise<void> {
   }
 
   const client = new CbmClient({ bin: cbmBin });
-  const version = await readVersion(cbmBin);
-  let project = await findProject(client);
+  try {
+    const version = await readVersion(cbmBin);
+    let project = await findProject(client);
 
-  if (!project) {
-    await client.indexRepository(repoPath);
-    project = await findProject(client);
-  }
-
-  if (!project) {
-    throw new Error(`Codebase Memory did not return an indexed project for ${repoPath}`);
-  }
-
-  const results = [];
-  for (const query of queries) {
-    const response = await client.searchGraph(project.name, query);
-    const search = unwrapStructured<SearchGraph>(response.parsed);
-    if (search?.total) {
-      results.push({ query, search });
+    if (!project) {
+      await client.indexRepository(repoPath);
+      project = await findProject(client);
     }
+
+    if (!project) {
+      throw new Error(`Codebase Memory did not return an indexed project for ${repoPath}`);
+    }
+
+    const results = [];
+    for (const query of queries) {
+      const response = await client.searchGraph(project.name, query);
+      const search = unwrapStructured<SearchGraph>(response.parsed);
+      if (search?.total) {
+        results.push({ query, search });
+      }
+    }
+
+    if (results.length === 0) {
+      throw new Error(`No matching Pokemon symbols found for ${queries.join(", ")}`);
+    }
+
+    const best = results[0];
+    const symbols = (best.search.rows ?? [])
+      .slice(0, 3)
+      .map((row) => String(row[0]))
+      .join(", ");
+    const elapsedMs = Math.round(performance.now() - start);
+
+    console.log(`cbm binary: ${cbmBin}`);
+    console.log(`cbm version: ${version}`);
+    console.log(`transport: ${client.transportKind}`);
+    console.log(`process starts: ${client.processStartCount}`);
+    console.log(`project: ${project.name}`);
+    console.log(`query: ${best.query}`);
+    console.log(`result count: ${best.search.total}`);
+    console.log(`symbols: ${symbols}`);
+    console.log(`elapsed ms: ${elapsedMs}`);
+  } finally {
+    await client.close();
   }
-
-  if (results.length === 0) {
-    throw new Error(`No matching Pokemon symbols found for ${queries.join(", ")}`);
-  }
-
-  const best = results[0];
-  const symbols = (best.search.rows ?? [])
-    .slice(0, 3)
-    .map((row) => String(row[0]))
-    .join(", ");
-  const elapsedMs = Math.round(performance.now() - start);
-
-  console.log(`cbm binary: ${cbmBin}`);
-  console.log(`cbm version: ${version}`);
-  console.log(`project: ${project.name}`);
-  console.log(`query: ${best.query}`);
-  console.log(`result count: ${best.search.total}`);
-  console.log(`symbols: ${symbols}`);
-  console.log(`elapsed ms: ${elapsedMs}`);
 }
 
 async function findProject(client: CbmClient): Promise<CbmProject | null> {

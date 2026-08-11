@@ -127,13 +127,14 @@ export async function buildRelevantContext(
 ): Promise<RelevantContext | null> {
   const start = options.now?.() ?? performance.now();
   let queryCount = 0;
+  const calls: Array<{ name: string; elapsedMs: number; transport?: string }> = [];
 
   try {
-    let resolution = await resolveCbmProject(repoPath, cbmClient);
+    let resolution = await timed(calls, "list_projects", () => resolveCbmProject(repoPath, cbmClient));
     if (!resolution.project && options.allowIndex && cbmClient.indexRepository) {
-      await cbmClient.indexRepository(repoPath);
+      await timed(calls, "index_repository", () => cbmClient.indexRepository!(repoPath));
       queryCount += 1;
-      resolution = await resolveCbmProject(repoPath, cbmClient);
+      resolution = await timed(calls, "list_projects", () => resolveCbmProject(repoPath, cbmClient));
     }
     if (!resolution.project) {
       return null;
@@ -147,17 +148,17 @@ export async function buildRelevantContext(
 
     for (const route of routes.slice(0, 1)) {
       queryCount += 1;
-      const routeSearch = await cbmClient.searchGraphByArgs({
+      const routeSearch = await timed(calls, "route search_graph", () => cbmClient.searchGraphByArgs({
         project,
         query: route,
         label: "Route",
         limit: 5
-      });
+      }));
       candidates.push(...symbolsFromSearch(routeSearch.parsed, repoPath, task, 40));
 
       if (candidates.length === 0) {
         queryCount += 1;
-        const routeCode = await cbmClient.searchCode(project, route);
+        const routeCode = await timed(calls, "route search_code", () => cbmClient.searchCode(project, route));
         candidates.push(...symbolsFromSearch(routeCode.parsed, repoPath, task, 15));
       }
     }
@@ -165,20 +166,20 @@ export async function buildRelevantContext(
     const symbolQuery = buildSymbolQuery(identifiers, routes);
     if (symbolQuery) {
       queryCount += 1;
-      const symbolSearch = await cbmClient.searchGraphByArgs({
+      const symbolSearch = await timed(calls, "symbol search_graph", () => cbmClient.searchGraphByArgs({
         project,
         query: symbolQuery,
         limit: 12
-      });
+      }));
       candidates.push(...symbolsFromSearch(symbolSearch.parsed, repoPath, task, 25));
     }
 
     const ranked = rankSymbols(dedupeSymbols(candidates), task, routes, identifiers);
     const traceTargets = ranked.slice(0, 2);
     const related: RelevantSymbol[] = [];
-    for (const target of traceTargets) {
+    for (const [index, target] of traceTargets.entries()) {
       queryCount += 1;
-      const trace = await cbmClient.tracePath(project, target.qualifiedName);
+      const trace = await timed(calls, `trace_path #${index + 1}`, () => cbmClient.tracePath(project, target.qualifiedName));
       const traced = symbolsFromTrace(trace.parsed, repoPath);
       related.push(...traced.symbols);
       relationships.push(...traced.relationships);
@@ -209,11 +210,35 @@ export async function buildRelevantContext(
       files,
       tests,
       relationships: relationships.slice(0, LIMITS.relationships),
-      querySummary: { queryCount, elapsedMs }
+      querySummary: {
+        queryCount,
+        elapsedMs,
+        transport: cbmClient.transportKind,
+        processStartCount: cbmClient.processStartCount,
+        calls
+      }
     };
   } catch {
     return null;
   }
+}
+
+async function timed<T>(
+  calls: Array<{ name: string; elapsedMs: number; transport?: string }>,
+  name: string,
+  fn: () => Promise<T>
+): Promise<T> {
+  const startedAt = performance.now();
+  const result = await fn();
+  const maybeTimed = result as { elapsedMs?: unknown; transport?: unknown };
+  const elapsedMs =
+    typeof maybeTimed.elapsedMs === "number" ? maybeTimed.elapsedMs : Math.round(performance.now() - startedAt);
+  calls.push({
+    name,
+    elapsedMs,
+    transport: typeof maybeTimed.transport === "string" ? maybeTimed.transport : undefined
+  });
+  return result;
 }
 
 export function buildExplorationGuidance(context: RelevantContext): string {

@@ -1,63 +1,39 @@
-import { spawn } from "node:child_process";
 import { loadConfig } from "../config.js";
-import type { CbmArgs, CbmClientOptions, CbmCommandResult } from "./types.js";
+import { CliCbmTransport, createDefaultTransport } from "./transport.js";
+import type { CbmArgs, CbmClientOptions, CbmCommandResult, CbmTransport } from "./types.js";
 
 export class CbmClient {
   readonly bin: string;
   readonly cwd?: string;
   readonly env: NodeJS.ProcessEnv;
+  readonly transport: CbmTransport;
+  private listProjectsCache: Promise<CbmCommandResult> | null = null;
 
   constructor(options: CbmClientOptions = {}) {
     const config = loadConfig(options.env);
     this.bin = options.bin ?? config.codebaseMemoryBin;
     this.cwd = options.cwd;
     this.env = options.env ?? process.env;
+    this.transport =
+      options.transport ??
+      (options.preferPersistent === false
+        ? new CliCbmTransport(options)
+        : createDefaultTransport(options));
   }
 
   run<T = unknown>(tool: string, args: CbmArgs = {}): Promise<CbmCommandResult<T>> {
-    const cliArgs = ["cli", "--json", tool, ...serializeArgs(args)];
-
-    return new Promise((resolve, reject) => {
-      const child = spawn(this.bin, cliArgs, {
-        cwd: this.cwd,
-        env: this.env,
-        stdio: ["ignore", "pipe", "pipe"]
-      });
-
-      let stdout = "";
-      let stderr = "";
-
-      child.stdout.setEncoding("utf8");
-      child.stderr.setEncoding("utf8");
-      child.stdout.on("data", (chunk) => {
-        stdout += chunk;
-      });
-      child.stderr.on("data", (chunk) => {
-        stderr += chunk;
-      });
-      child.on("error", reject);
-      child.on("close", (code) => {
-        if (code !== 0) {
-          reject(new Error(`Codebase Memory command failed (${code}): ${stderr || stdout}`));
-          return;
-        }
-
-        resolve({
-          command: tool,
-          args: cliArgs,
-          stdout,
-          stderr,
-          parsed: parseJson<T>(stdout)
-        });
-      });
-    });
+    return this.transport.callTool<T>(tool, args);
   }
 
   listProjects(): Promise<CbmCommandResult> {
-    return this.run("list_projects");
+    if (!this.listProjectsCache) {
+      this.listProjectsCache = this.run("list_projects");
+    }
+    return this.listProjectsCache;
   }
 
   indexRepository(repoPath: string, name?: string): Promise<CbmCommandResult> {
+    this.listProjectsCache = null;
     return this.run("index_repository", {
       "repo-path": repoPath,
       name
@@ -99,6 +75,26 @@ export class CbmClient {
       limit: 20
     });
   }
+
+  close(): Promise<void> | void {
+    this.listProjectsCache = null;
+    return this.transport.close();
+  }
+
+  async warmup(): Promise<void> {
+    await this.listProjects();
+  }
+
+  get transportKind(): string {
+    if ("activeKind" in this.transport && typeof this.transport.activeKind === "string") {
+      return this.transport.activeKind;
+    }
+    return this.transport.kind;
+  }
+
+  get processStartCount(): number {
+    return this.transport.processStartCount;
+  }
 }
 
 export function serializeArgs(args: CbmArgs): string[] {
@@ -126,25 +122,4 @@ export function serializeArgs(args: CbmArgs): string[] {
   }
 
   return serialized;
-}
-
-function parseJson<T>(value: string): T | null {
-  const trimmed = value.trim();
-  if (!trimmed) {
-    return null;
-  }
-
-  for (let index = 0; index < trimmed.length; index += 1) {
-    if (trimmed[index] !== "{") {
-      continue;
-    }
-
-    try {
-      return JSON.parse(trimmed.slice(index)) as T;
-    } catch {
-      continue;
-    }
-  }
-
-  return null;
 }

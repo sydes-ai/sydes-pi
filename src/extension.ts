@@ -73,6 +73,7 @@ export default function sydesPiExtension(pi: ExtensionAPI): void {
           "Sydes status",
           `policy: ${extension.policyEnabled ? "enabled" : "disabled"}`,
           `cbm: ${cbmPath ?? "not found"}`,
+          `CBM transport: ${extension.cbm.transportKind}`,
           `project: ${resolution.project?.name ?? "unresolved"}`,
           resolution.reason ? `reason: ${resolution.reason}` : undefined
         ]
@@ -117,6 +118,9 @@ export default function sydesPiExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("before_agent_start", createBeforeAgentStartHandler(extension.cbm, state));
+  pi.on("session_shutdown", async () => {
+    await extension.cbm.close();
+  });
 }
 
 export function createBeforeAgentStartHandler(cbm: CbmClient, state: SydesRuntimeState) {

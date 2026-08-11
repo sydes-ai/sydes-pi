@@ -24,7 +24,16 @@ export interface RelevantContext {
   querySummary: {
     queryCount: number;
     elapsedMs: number;
+    transport?: string;
+    processStartCount?: number;
+    calls?: RelevantQueryTiming[];
   };
+}
+
+export interface RelevantQueryTiming {
+  name: string;
+  elapsedMs: number;
+  transport?: string;
 }
 
 export interface CbmProject {
@@ -34,6 +43,8 @@ export interface CbmProject {
 }
 
 export interface PolicyCbmClient {
+  readonly transportKind?: string;
+  readonly processStartCount?: number;
   listProjects(): Promise<{ parsed: unknown }>;
   indexRepository?(repoPath: string, name?: string): Promise<{ parsed: unknown }>;
   searchGraphByArgs(args: Record<string, string | number | boolean | readonly (string | number | boolean)[] | undefined>): Promise<{ parsed: unknown }>;

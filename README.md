@@ -7,7 +7,8 @@ Phase 0 keeps the implementation intentionally small:
 - Pi owns the normal agent loop, model/provider calls, filesystem tools, shell tools, sessions, and compaction.
 - Sydes exposes only foundation wiring for now.
 - Codebase Memory is treated as a local structural graph backend through its one-shot CLI.
-- No MCP client, graph-guided policy, verification policy, telemetry, benchmark runner, model calls, custom editor, custom patch tool, or tool overrides are included.
+- No model-facing CBM tools, verification policy, telemetry, benchmark runner, model calls, custom editor, custom patch tool, or tool overrides are included.
+- Sydes uses a narrow internal CBM transport for local graph calls; it is not exposed to Pi's model/tool surface.
 
 ## Local Commands
 

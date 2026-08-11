@@ -140,6 +140,12 @@ describe("Phase 1 exploration policy", () => {
     expect(context?.querySummary.queryCount).toBeGreaterThanOrEqual(3);
   });
 
+  it("does not call list_projects redundantly within one context build", async () => {
+    const client = makeClient();
+    await buildRelevantContext("POST /api/v1/pokemon hp AddPokemon tests", repoPath, client);
+    expect(client.listProjects).toHaveBeenCalledTimes(1);
+  });
+
   it("injects before_agent_start guidance for normal coding tasks", async () => {
     const state = { lastContext: null, lastReason: null };
     const result = await createBeforeAgentStartHandler(makeClient() as never, state)(

@@ -160,3 +160,37 @@ export interface GitDiffResult {
 export interface GitDiffProvider {
   getCurrentDiff(repoPath: string): Promise<GitDiffResult | null>;
 }
+
+export interface SourceSymbolRange {
+  name: string;
+  qualifiedName: string;
+  kind: string;
+  filePath: string;
+  startLine?: number;
+  endLine?: number;
+}
+
+export interface ChangedSymbol {
+  name: string;
+  qualifiedName?: string;
+  kind?: string;
+  filePath: string;
+  changeKinds: Array<"add" | "delete" | "modify">;
+  insertions: number;
+  deletions: number;
+}
+
+export interface ChangeSurfaceDrift {
+  changedFiles: string[];
+  expectedFiles: string[];
+  unexpectedFiles: string[];
+  expectedChangedSymbols: ChangedSymbol[];
+  unexpectedChangedSymbols: ChangedSymbol[];
+  unrelatedDeletions: ChangedSymbol[];
+  unrelatedModifiedRanges: ChangedSymbol[];
+  insertionCount: number;
+  deletionCount: number;
+  severity: "none" | "low" | "medium" | "high";
+  reasons: string[];
+  signature: string;
+}

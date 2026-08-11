@@ -1,5 +1,5 @@
 import { readFile, writeFile } from "node:fs/promises";
-import { basename, relative, resolve } from "node:path";
+import { canonicalRepoRelativePath } from "../policy/paths.js";
 
 interface AnalyzerInput {
   sessionPath: string;
@@ -17,6 +17,7 @@ interface ToolCall {
   name: string;
   args?: unknown;
   turn: number;
+  timestamp?: string;
 }
 
 interface ToolResult {
@@ -25,6 +26,7 @@ interface ToolResult {
   isError?: boolean;
   content?: unknown;
   turn: number;
+  timestamp?: string;
 }
 
 export async function analyzeSession(input: AnalyzerInput): Promise<Record<string, unknown>> {
@@ -55,11 +57,15 @@ export async function analyzeSession(input: AnalyzerInput): Promise<Record<strin
     .flatMap((call) => readPathsForCall(call, input.repoRoot))
     .filter((path): path is string => !!path);
   const firstEdit = firstSuccessfulEdit(calls, results, input.repoRoot);
-  const priority = new Set<string>([
-    ...(sydes.explorationContext?.files ?? []),
-    ...(sydes.explorationContext?.tests ?? []),
-    ...((sydes.explorationContext?.entryPoints ?? []).map((entry: any) => entry.filePath).filter(Boolean) ?? [])
-  ]);
+  const priority = new Set<string>(
+    [
+      ...(sydes.explorationContext?.files ?? []),
+      ...(sydes.explorationContext?.tests ?? []),
+      ...((sydes.explorationContext?.entryPoints ?? []).map((entry: any) => entry.filePath).filter(Boolean) ?? [])
+    ]
+      .map((path) => canonicalRepoRelativePath(input.repoRoot, path))
+      .filter((path): path is string => !!path)
+  );
   const first5 = reads.slice(0, 5);
   const first10 = reads.slice(0, 10);
   const first3 = reads.slice(0, 3);
@@ -115,7 +121,7 @@ export async function analyzeSession(input: AnalyzerInput): Promise<Record<strin
     editing: {
       firstEditFile: firstEdit?.file ?? null,
       firstEditTurn: firstEdit?.turn ?? null,
-      timeToFirstEditSeconds: null,
+      timeToFirstEditSeconds: firstEdit?.timestamp ? elapsedSeconds(run.startTime, firstEdit.timestamp) : null,
       filesChanged: diffSummary.files,
       insertions: diffSummary.insertions,
       deletions: diffSummary.deletions
@@ -138,6 +144,10 @@ export async function analyzeSession(input: AnalyzerInput): Promise<Record<strin
       projectReadinessWaitMs: sydes.explorationContext?.projectReadinessWaitMs ?? null,
       projectReadinessPollCount: sydes.explorationContext?.projectReadinessPollCount ?? null,
       projectReadinessStrategy: sydes.explorationContext?.projectReadinessStrategy ?? null,
+      driftAnalysisCount: sydes.driftAnalysisCount ?? 0,
+      driftWarningCount: sydes.driftWarningCount ?? 0,
+      latestDriftSeverity: sydes.driftEvents?.at?.(-1)?.severity ?? null,
+      latestUnexpectedChangedSymbols: sydes.driftEvents?.at?.(-1)?.unexpectedChangedSymbols ?? [],
       impactInjectionHook: sydes.impactGuidanceEvents?.at?.(-1)?.injectionHook ?? null,
       impactGuidanceSuppressedAsAlreadyVerified: !!sydes.impactGuidanceEvents?.some?.((event: any) => event.suppressedAsAlreadyVerified),
       impactGuidanceInjectedBeforeNextModelTurn: !!sydes.impactGuidanceEvents?.some?.((event: any) => event.injectedBeforeNextModelTurn)
@@ -153,12 +163,22 @@ function getRole(entry: any): string | undefined {
 
 function collectToolCalls(entries: unknown[]): ToolCall[] {
   const calls: ToolCall[] = [];
-  entries.forEach((entry, turn) => {
+  let assistantTurn = 0;
+  entries.forEach((entry) => {
+    if (getRole(entry) === "assistant") {
+      assistantTurn += 1;
+    }
     for (const object of walkObjects(entry)) {
       const id = stringValue(object.toolCallId ?? object.tool_call_id ?? object.id);
       const name = stringValue(object.toolName ?? object.name);
       if (id && name && (object.args || object.input || object.parameters || object.arguments)) {
-        calls.push({ id, name, args: object.args ?? object.input ?? object.parameters ?? object.arguments, turn });
+        calls.push({
+          id,
+          name,
+          args: object.args ?? object.input ?? object.parameters ?? object.arguments,
+          turn: assistantTurn,
+          timestamp: stringValue(object.timestamp) ?? stringValue((entry as any)?.timestamp)
+        });
       }
     }
   });
@@ -167,11 +187,22 @@ function collectToolCalls(entries: unknown[]): ToolCall[] {
 
 function collectToolResults(entries: unknown[]): ToolResult[] {
   const results: ToolResult[] = [];
-  entries.forEach((entry, turn) => {
+  let assistantTurn = 0;
+  entries.forEach((entry) => {
+    if (getRole(entry) === "assistant") {
+      assistantTurn += 1;
+    }
     for (const object of walkObjects(entry)) {
       const id = stringValue(object.toolCallId ?? object.tool_call_id);
       if (id && ("isError" in object || "content" in object) && !("args" in object)) {
-        results.push({ id, name: stringValue(object.toolName), isError: typeof object.isError === "boolean" ? object.isError : undefined, content: object.content, turn });
+        results.push({
+          id,
+          name: stringValue(object.toolName),
+          isError: typeof object.isError === "boolean" ? object.isError : undefined,
+          content: object.content,
+          turn: assistantTurn,
+          timestamp: stringValue(object.timestamp) ?? stringValue((entry as any)?.timestamp)
+        });
       }
     }
   });
@@ -217,10 +248,10 @@ function aggregateUsage(entries: unknown[]): Record<string, number | null> {
   };
 }
 
-function firstSuccessfulEdit(calls: ToolCall[], results: ToolResult[], repoRoot: string): { file: string | null; turn: number } | null {
+function firstSuccessfulEdit(calls: ToolCall[], results: ToolResult[], repoRoot: string): { file: string | null; turn: number; timestamp?: string } | null {
   const successfulIds = new Set(results.filter((result) => result.isError === false).map((result) => result.id));
   const call = calls.find((item) => (item.name === "edit" || item.name === "write") && successfulIds.has(item.id));
-  return call ? { file: normalizePath(repoRoot, getArgPath(call.args)) ?? null, turn: call.turn } : null;
+  return call ? { file: normalizePath(repoRoot, getArgPath(call.args)) ?? null, turn: call.turn, timestamp: call.timestamp } : null;
 }
 
 function lastSuccessfulEditTurn(calls: ToolCall[], results: ToolResult[]): number | null {
@@ -247,14 +278,23 @@ function firstPriorityReadTurn(calls: ToolCall[], repoRoot: string, priority: Se
 }
 
 function getArgPath(args: unknown): string | undefined {
-  return typeof (args as any)?.path === "string" ? (args as any).path : undefined;
+  const decoded = decodeArgs(args);
+  return typeof decoded?.path === "string" ? decoded.path : undefined;
+}
+
+function decodeArgs(args: unknown): any {
+  if (typeof args === "string") {
+    try {
+      return JSON.parse(args);
+    } catch {
+      return {};
+    }
+  }
+  return args as any;
 }
 
 function normalizePath(repoRoot: string, path: string | undefined): string | undefined {
-  if (!path) return undefined;
-  const abs = path.startsWith("/") ? path : resolve(repoRoot, path);
-  const rel = relative(resolve(repoRoot), resolve(abs)).split(/[\\/]+/).join("/");
-  return rel && !rel.startsWith("..") ? rel : path.split(/[\\/]+/).slice(-2).join("/");
+  return canonicalRepoRelativePath(repoRoot, path);
 }
 
 function readPathsForCall(call: ToolCall, repoRoot: string): string[] {
@@ -263,7 +303,7 @@ function readPathsForCall(call: ToolCall, repoRoot: string): string[] {
     return path ? [path] : [];
   }
   if (call.name !== "bash") return [];
-  const command = String((call.args as any)?.command ?? "");
+  const command = String(decodeArgs(call.args)?.command ?? "");
   const paths = new Set<string>();
   for (const match of command.matchAll(/\b(?:sed|nl|cat)\b(?:\s+-[^\s]+)*\s+(?:'[^']*'\s+|"[^"]*"\s+)?([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)/g)) {
     const path = normalizePath(repoRoot, match[1]);

@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { basename, relative, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { promisify } from "node:util";
+import { canonicalRepoRelativePath } from "./paths.js";
 import type {
   BuildRelevantContextOptions,
   CbmProject,
@@ -538,15 +539,7 @@ export function buildExplorationGuidance(context: RelevantContext): string {
 }
 
 export function normalizeRepoPath(repoPath: string, filePath: string | undefined): string | undefined {
-  if (!filePath) {
-    return undefined;
-  }
-  const absolute = filePath.startsWith("/") ? filePath : resolve(repoPath, filePath);
-  const normalized = relative(resolve(repoPath), resolve(absolute)).split(/[\\/]+/).join("/");
-  if (!normalized || normalized.startsWith("..") || normalized.startsWith("/")) {
-    return undefined;
-  }
-  return normalized;
+  return canonicalRepoRelativePath(repoPath, filePath);
 }
 
 export function rankSymbols(

@@ -294,6 +294,9 @@ function printSummary(summary: Record<string, unknown>, context: RelevantContext
   console.log(`priority hits: ${(anySummary.exploration?.first3PriorityHits ?? []).join(", ") || "none"}`);
   console.log(`first edit: ${anySummary.editing?.firstEditFile ?? "none"}`);
   console.log(`impact guidance count: ${anySummary.sydes?.impactGuidanceCount ?? 0}`);
+  console.log(`drift severity: ${anySummary.sydes?.latestDriftSeverity ?? "none"}`);
+  console.log(`drift warning count: ${anySummary.sydes?.driftWarningCount ?? 0}`);
+  console.log(`unexpected changed symbols: ${(anySummary.sydes?.latestUnexpectedChangedSymbols ?? []).map((symbol: any) => symbol.name ?? symbol.qualifiedName ?? String(symbol)).join(", ") || "none"}`);
   console.log(`CBM readiness wait: ${context.projectReadinessWaitMs ?? "n/a"}ms`);
   console.log(`repo tests: ${anySummary.correctness?.repoTests ?? "unknown"}`);
   console.log(`hidden oracle: ${anySummary.correctness?.hiddenOracle ?? "unknown"}`);

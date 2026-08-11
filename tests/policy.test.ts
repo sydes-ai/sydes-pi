@@ -368,7 +368,9 @@ function makeState() {
     testCommandsAfterLastMutation: [],
     projectCache: new Map(),
     impactInjectionBoundary: "context" as const,
-    lastImpactSignature: null
+    lastImpactSignature: null,
+    lastDrift: null,
+    lastDriftSignature: null
   };
 }
 

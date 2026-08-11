@@ -14,8 +14,10 @@
     "smoke:impact": "vite-node scripts/smoke-impact.ts",
     "smoke:policy": "vite-node scripts/smoke-policy.ts",
     "smoke:worktree-policy": "vite-node scripts/smoke-worktree-policy.ts",
+    "smoke:drift-replay": "vite-node scripts/smoke-drift-replay.ts",
     "smoke:pi": "vite-node scripts/smoke-pi.ts",
-    "live:sydes": "vite-node scripts/run-live-sydes.ts"
+    "live:sydes": "vite-node scripts/run-live-sydes.ts",
+    "analyze:latest": "vite-node scripts/analyze-latest.ts"
   },
   "keywords": [
     "sydes",

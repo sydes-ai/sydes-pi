@@ -11,11 +11,18 @@ import { findExecutable } from "./cbm/paths.js";
 import { loadConfig } from "./config.js";
 import { buildExplorationGuidance, buildRelevantContext, ensureProjectForRepo } from "./policy/exploration.js";
 import {
+  analyzeChangeSurfaceDrift,
+  buildChangeSurfaceGuidance,
+  loadSourceSymbolsForDiff,
+  shouldInjectDriftWarning
+} from "./policy/drift.js";
+import {
   buildAffectedContext,
   buildImpactGuidance,
+  gitDiffProvider,
   normalizeRepoPath as normalizeImpactPath
 } from "./policy/impact.js";
-import type { AffectedContext, RelevantContext } from "./policy/types.js";
+import type { AffectedContext, ChangeSurfaceDrift, RelevantContext } from "./policy/types.js";
 import type { ProjectEnsureCacheEntry } from "./policy/types.js";
 import { SydesTelemetryRecorder } from "./telemetry/recorder.js";
 
@@ -65,6 +72,8 @@ export interface SydesRuntimeState {
   pendingMutations: ObservedMutation[];
   testCommandsAfterLastMutation: ObservedTestCommand[];
   lastImpactSignature: string | null;
+  lastDrift: ChangeSurfaceDrift | null;
+  lastDriftSignature: string | null;
   projectCache: Map<string, ProjectEnsureCacheEntry>;
   impactInjectionBoundary: "context";
   telemetry?: SydesTelemetryRecorder;
@@ -92,6 +101,8 @@ export default function sydesPiExtension(pi: ExtensionAPI): void {
     pendingMutations: [],
     testCommandsAfterLastMutation: [],
     lastImpactSignature: null,
+    lastDrift: null,
+    lastDriftSignature: null,
     lastReason: null,
     projectCache: new Map(),
     impactInjectionBoundary: "context",
@@ -195,13 +206,37 @@ export default function sydesPiExtension(pi: ExtensionAPI): void {
     }
   });
 
+  pi.registerCommand("sydes-drift", {
+    description: "Analyze current change-surface drift without calling a model",
+    handler: async (_args, ctx) => {
+      const drift = await buildCurrentDrift(extension.cbm, state, ctx.cwd);
+      if (!drift) {
+        state.lastReason = "No current changes or Sydes drift context unavailable";
+        ctx.ui.notify(state.lastReason, "warning");
+        return;
+      }
+      state.lastDrift = drift;
+      ctx.ui.notify(renderDriftDebugContext(drift), drift.severity === "none" || drift.severity === "low" ? "info" : "warning");
+    }
+  });
+
+  pi.registerCommand("sydes-drift-last", {
+    description: "Show the last Sydes change-surface drift analysis",
+    handler: async (_args, ctx) => {
+      ctx.ui.notify(
+        state.lastDrift ? renderDriftDebugContext(state.lastDrift) : state.lastReason ?? "No Sydes drift analysis yet",
+        state.lastDrift ? "info" : "warning"
+      );
+    }
+  });
+
   pi.on("before_agent_start", createBeforeAgentStartHandler(extension.cbm, state));
   pi.on("tool_result", (event, ctx) => {
     observeMutationResult(event, ctx.cwd, state);
     observeTestResult(event, state);
   });
   (pi.on as (event: "context", handler: (event: ContextEvent, ctx: ExtensionContext) => Promise<{ messages?: unknown[] } | undefined>) => void)("context", async (event, ctx) => {
-    return maybeInjectImpactGuidanceIntoContext(extension.cbm, state, ctx.cwd, event);
+    return maybeInjectPolicyGuidanceIntoContext(extension.cbm, state, ctx.cwd, event);
   });
   pi.on("session_shutdown", async () => {
     state.telemetry?.recordCbm(extension.cbm.processStartCount, extension.cbm.transportKind);
@@ -351,6 +386,83 @@ export async function maybeInjectImpactGuidanceIntoContext(
   };
 }
 
+export async function maybeInjectPolicyGuidanceIntoContext(
+  cbm: CbmClient,
+  state: SydesRuntimeState,
+  cwd: string,
+  event: ContextEvent,
+  impactBuilder: (repoPath: string, cbmClient: CbmClient) => Promise<AffectedContext | null> = (repoPath, cbmClient) =>
+    buildAffectedContext(repoPath, cbmClient, undefined, {
+      allowIndex: true,
+      cache: state.projectCache
+    })
+): Promise<{ messages?: unknown[] } | undefined> {
+  const messages = [...event.messages];
+  const impact = await buildPendingImpactGuidance(cbm, state, cwd, "context", impactBuilder);
+  if (impact && !impact.suppressed) {
+    messages.push({
+      role: "custom",
+      customType: "sydes-impact-guidance",
+      content: impact.message.content,
+      display: impact.message.display,
+      details: impact.message.details,
+      timestamp: Date.now()
+    } as never);
+  }
+
+  const drift = await buildCurrentDrift(cbm, state, cwd);
+  if (drift) {
+    state.lastDrift = drift;
+    const injected = shouldInjectDriftWarning(drift, state.lastDriftSignature);
+    const guidance = buildChangeSurfaceGuidance(drift);
+    state.telemetry?.recordDrift(drift, guidance, {
+      injectionHook: "context",
+      injected,
+      injectedBeforeNextModelTurn: injected
+    });
+    if (injected) {
+      state.lastDriftSignature = drift.signature;
+      messages.push({
+        role: "custom",
+        customType: "sydes-change-surface-warning",
+        content: guidance,
+        display: true,
+        details: { drift },
+        timestamp: Date.now()
+      } as never);
+    }
+  }
+
+  return messages.length === event.messages.length ? undefined : { messages };
+}
+
+export async function buildCurrentDrift(
+  cbm: CbmClient,
+  state: SydesRuntimeState,
+  cwd: string
+): Promise<ChangeSurfaceDrift | null> {
+  if (!state.lastContext) {
+    return null;
+  }
+  const diff = await gitDiffProvider.getCurrentDiff(cwd);
+  if (!diff) {
+    return null;
+  }
+  const resolution = await ensureProjectForRepo(cwd, cbm, {
+    allowIndex: true,
+    cache: state.projectCache
+  });
+  const project = resolution.project?.name ?? state.lastContext.project;
+  const repoRoot = resolution.repoRoot ?? cwd;
+  const sourceSymbols = await loadSourceSymbolsForDiff(project, repoRoot, cbm, diff.diffText, state.lastContext);
+  return analyzeChangeSurfaceDrift({
+    relevantContext: state.lastContext,
+    affectedContext: state.lastAffectedContext,
+    diffText: diff.diffText,
+    sourceSymbols
+  });
+}
+
 async function buildPendingImpactGuidance(
   cbm: CbmClient,
   state: SydesRuntimeState,
@@ -454,5 +566,23 @@ export function renderImpactDebugContext(context: AffectedContext): string {
     `elapsed ms: ${context.querySummary.elapsedMs}`,
     "",
     buildImpactGuidance(context)
+  ].join("\n");
+}
+
+export function renderDriftDebugContext(drift: ChangeSurfaceDrift): string {
+  return [
+    "Sydes drift",
+    `severity: ${drift.severity}`,
+    `changed files: ${drift.changedFiles.join(", ") || "none"}`,
+    `expected files: ${drift.expectedFiles.join(", ") || "none"}`,
+    `unexpected files: ${drift.unexpectedFiles.join(", ") || "none"}`,
+    `expected changed symbols: ${drift.expectedChangedSymbols.map((symbol) => `${symbol.filePath}:${symbol.name}`).join(", ") || "none"}`,
+    `unexpected changed symbols: ${drift.unexpectedChangedSymbols.map((symbol) => `${symbol.filePath}:${symbol.name}`).join(", ") || "none"}`,
+    `unrelated deletions: ${drift.unrelatedDeletions.map((symbol) => `${symbol.filePath}:${symbol.name}`).join(", ") || "none"}`,
+    `insertions/deletions: ${drift.insertionCount}/${drift.deletionCount}`,
+    `reasons: ${drift.reasons.join("; ") || "none"}`,
+    `signature: ${drift.signature}`,
+    "",
+    buildChangeSurfaceGuidance(drift)
   ].join("\n");
 }

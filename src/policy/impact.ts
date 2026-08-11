@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { relative, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { promisify } from "node:util";
 import type {
@@ -14,6 +13,7 @@ import type {
   PolicyCbmClient
 } from "./types.js";
 import { ensureProjectForRepo } from "./exploration.js";
+import { canonicalRepoRelativePath } from "./paths.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -196,15 +196,7 @@ export function boundAffectedContext(context: AffectedContext): AffectedContext 
 }
 
 export function normalizeRepoPath(repoPath: string, filePath: string | undefined): string | undefined {
-  if (!filePath) {
-    return undefined;
-  }
-  const absolute = filePath.startsWith("/") ? filePath : resolve(repoPath, filePath);
-  const normalized = relative(resolve(repoPath), resolve(absolute)).split(/[\\/]+/).join("/");
-  if (!normalized || normalized.startsWith("..") || normalized.startsWith("/")) {
-    return undefined;
-  }
-  return normalized;
+  return canonicalRepoRelativePath(repoPath, filePath);
 }
 
 function symbolFromImpact(

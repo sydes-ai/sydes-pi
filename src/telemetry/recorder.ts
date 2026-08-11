@@ -1,6 +1,6 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { AffectedContext, RelevantContext } from "../policy/types.js";
+import type { AffectedContext, ChangeSurfaceDrift, RelevantContext } from "../policy/types.js";
 
 export interface SydesTelemetry {
   explorationGuidanceInjected: boolean;
@@ -35,6 +35,24 @@ export interface SydesTelemetry {
     suppressedAsAlreadyVerified?: boolean;
     injectedBeforeNextModelTurn?: boolean;
   }>;
+  driftAnalysisCount: number;
+  driftWarningCount: number;
+  driftEvents: Array<{
+    changedFiles: string[];
+    expectedFiles: string[];
+    unexpectedFiles: string[];
+    expectedChangedSymbols: unknown[];
+    unexpectedChangedSymbols: unknown[];
+    severity: string;
+    reasons: string[];
+    insertions: number;
+    deletions: number;
+    signature: string;
+    injected: boolean;
+    injectionHook?: string;
+    injectedBeforeNextModelTurn?: boolean;
+    guidanceText?: string;
+  }>;
   cbmProcessStartCount?: number;
   cbmTransport?: string;
   cbmFallbackUsed?: boolean;
@@ -45,7 +63,10 @@ export class SydesTelemetryRecorder {
   private data: SydesTelemetry = {
     explorationGuidanceInjected: false,
     impactGuidanceCount: 0,
-    impactGuidanceEvents: []
+    impactGuidanceEvents: [],
+    driftAnalysisCount: 0,
+    driftWarningCount: 0,
+    driftEvents: []
   };
 
   constructor(runDir = process.env.SYDES_RUN_DIR) {
@@ -122,6 +143,38 @@ export class SydesTelemetryRecorder {
     this.data.cbmProcessStartCount = cbmProcessStartCount;
     this.data.cbmTransport = cbmTransport;
     this.data.cbmFallbackUsed = cbmTransport.includes("fallback") || this.data.cbmFallbackUsed;
+    void this.flush();
+  }
+
+  recordDrift(
+    drift: ChangeSurfaceDrift,
+    guidanceText: string,
+    options: {
+      injectionHook?: string;
+      injected?: boolean;
+      injectedBeforeNextModelTurn?: boolean;
+    } = {}
+  ): void {
+    this.data.driftAnalysisCount += 1;
+    if (options.injected) {
+      this.data.driftWarningCount += 1;
+    }
+    this.data.driftEvents.push({
+      changedFiles: drift.changedFiles,
+      expectedFiles: drift.expectedFiles,
+      unexpectedFiles: drift.unexpectedFiles,
+      expectedChangedSymbols: drift.expectedChangedSymbols,
+      unexpectedChangedSymbols: drift.unexpectedChangedSymbols,
+      severity: drift.severity,
+      reasons: drift.reasons,
+      insertions: drift.insertionCount,
+      deletions: drift.deletionCount,
+      signature: drift.signature,
+      injected: !!options.injected,
+      injectionHook: options.injectionHook,
+      injectedBeforeNextModelTurn: options.injectedBeforeNextModelTurn,
+      guidanceText: options.injected ? guidanceText : undefined
+    });
     void this.flush();
   }
 

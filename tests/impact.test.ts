@@ -76,7 +76,9 @@ function makeState(): SydesRuntimeState {
     testCommandsAfterLastMutation: [],
     projectCache: new Map(),
     impactInjectionBoundary: "context",
-    lastImpactSignature: null
+    lastImpactSignature: null,
+    lastDrift: null,
+    lastDriftSignature: null
   };
 }
 

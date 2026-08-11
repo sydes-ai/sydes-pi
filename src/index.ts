@@ -13,10 +13,21 @@ export {
   createBeforeAgentStartHandler,
   createSydesExtension,
   default,
+  maybeSendImpactGuidance,
+  observeMutationResult,
   renderDebugContext,
+  renderImpactDebugContext,
   shouldInjectForPrompt
 } from "./extension.js";
-export type { SydesExtension, SydesExtensionContext, SydesRuntimeState } from "./extension.js";
+export type { ObservedMutation, SydesExtension, SydesExtensionContext, SydesRuntimeState } from "./extension.js";
+export {
+  buildAffectedContext,
+  buildImpactGuidance,
+  boundAffectedContext,
+  gitDiffProvider,
+  normalizeRepoPath as normalizeImpactPath,
+  signatureForAffectedContext
+} from "./policy/impact.js";
 export {
   buildExplorationGuidance,
   buildRelevantContext,
@@ -28,8 +39,14 @@ export {
   resolveCbmProject
 } from "./policy/exploration.js";
 export type {
+  AffectedContext,
+  AffectedRelationship,
+  AffectedRoute,
+  AffectedSymbol,
   BuildRelevantContextOptions,
   CbmProject,
+  GitDiffProvider,
+  GitDiffResult,
   PolicyCbmClient,
   ProjectResolution,
   RelevantContext,

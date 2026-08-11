@@ -10,6 +10,7 @@
     "check": "npm run build && npm test",
     "smoke:cbm": "vite-node scripts/smoke-cbm.ts",
     "smoke:cbm-latency": "vite-node scripts/smoke-cbm-latency.ts",
+    "smoke:impact": "vite-node scripts/smoke-impact.ts",
     "smoke:policy": "vite-node scripts/smoke-policy.ts",
     "smoke:pi": "vite-node scripts/smoke-pi.ts"
   },

@@ -23,6 +23,7 @@ function makeClient(overrides: Partial<PolicyCbmClient> = {}): PolicyCbmClient {
   return {
     listProjects: vi.fn(async () => envelope({ projects: [{ name: projectName, root_path: repoPath }] })),
     searchCode: vi.fn(async () => envelope({})),
+    detectChanges: vi.fn(async () => envelope({})),
     searchGraphByArgs: vi.fn(async (args) => {
       if (args.label === "Route") {
         return envelope({ total: 0, cols: ["qn", "label", "file", "lines", "rank"], rows: [], has_more: false });
@@ -147,7 +148,7 @@ describe("Phase 1 exploration policy", () => {
   });
 
   it("injects before_agent_start guidance for normal coding tasks", async () => {
-    const state = { lastContext: null, lastReason: null };
+    const state = makeState();
     const result = await createBeforeAgentStartHandler(makeClient() as never, state)(
       {
         type: "before_agent_start",
@@ -162,7 +163,7 @@ describe("Phase 1 exploration policy", () => {
   });
 
   it("does not inject when CBM fails", async () => {
-    const state = { lastContext: null, lastReason: null };
+    const state = makeState();
     const result = await createBeforeAgentStartHandler(makeClient({ listProjects: vi.fn(async () => Promise.reject(new Error("nope"))) }) as never, state)(
       {
         type: "before_agent_start",
@@ -194,6 +195,17 @@ describe("Phase 1 exploration policy", () => {
     expect(pi.registerTool).not.toHaveBeenCalled();
   });
 });
+
+function makeState() {
+  return {
+    lastContext: null,
+    lastAffectedContext: null,
+    lastReason: null,
+    impactDirty: false,
+    pendingMutations: [],
+    lastImpactSignature: null
+  };
+}
 
 function symbol(filePath: string, name: string): RelevantSymbol {
   return {

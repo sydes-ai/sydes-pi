@@ -56,8 +56,17 @@ function verifyRegistrations(): { commands: string[]; hooks: string[] } {
   if (!commands.includes("sydes-context")) {
     throw new Error("/sydes-context was not registered");
   }
+  if (!commands.includes("sydes-impact")) {
+    throw new Error("/sydes-impact was not registered");
+  }
   if (!hooks.includes("before_agent_start")) {
     throw new Error("before_agent_start was not registered");
+  }
+  if (!hooks.includes("tool_result")) {
+    throw new Error("tool_result was not registered");
+  }
+  if (!hooks.includes("agent_settled")) {
+    throw new Error("agent_settled was not registered");
   }
 
   return { commands, hooks };

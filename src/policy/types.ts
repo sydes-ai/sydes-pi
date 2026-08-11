@@ -50,6 +50,7 @@ export interface PolicyCbmClient {
   searchGraphByArgs(args: Record<string, string | number | boolean | readonly (string | number | boolean)[] | undefined>): Promise<{ parsed: unknown }>;
   searchCode(project: string, pattern: string): Promise<{ parsed: unknown }>;
   tracePath(project: string, functionName: string): Promise<{ parsed: unknown }>;
+  detectChanges(project: string): Promise<{ parsed: unknown; elapsedMs?: number; transport?: string }>;
 }
 
 export interface BuildRelevantContextOptions {
@@ -60,4 +61,53 @@ export interface BuildRelevantContextOptions {
 export interface ProjectResolution {
   project: CbmProject | null;
   reason?: string;
+}
+
+export interface AffectedSymbol {
+  name: string;
+  qualifiedName: string;
+  kind: string;
+  filePath?: string;
+  hop?: number;
+}
+
+export interface AffectedRoute {
+  method?: string;
+  path: string;
+  filePath?: string;
+  hop?: number;
+}
+
+export interface AffectedRelationship {
+  from: string;
+  to: string;
+  type: string;
+}
+
+export interface AffectedContext {
+  project: string;
+  changedFiles: string[];
+  changedSymbols: AffectedSymbol[];
+  impactedSymbols: AffectedSymbol[];
+  routes: AffectedRoute[];
+  tests: string[];
+  relationships: AffectedRelationship[];
+  risk?: string | number;
+  signature: string;
+  querySummary: {
+    queryCount: number;
+    elapsedMs: number;
+    detectChangesElapsedMs?: number;
+    transport?: string;
+    processStartCount?: number;
+  };
+}
+
+export interface GitDiffResult {
+  changedFiles: string[];
+  diffText: string;
+}
+
+export interface GitDiffProvider {
+  getCurrentDiff(repoPath: string): Promise<GitDiffResult | null>;
 }

@@ -76,6 +76,17 @@ export class CbmClient {
     });
   }
 
+  detectChanges(project: string): Promise<CbmCommandResult> {
+    return this.run("detect_changes", {
+      project,
+      scope: "impact",
+      direction: "both",
+      depth: 2,
+      limit: 30,
+      format: "json"
+    });
+  }
+
   close(): Promise<void> | void {
     this.listProjectsCache = null;
     return this.transport.close();

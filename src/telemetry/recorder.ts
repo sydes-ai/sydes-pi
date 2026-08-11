@@ -14,6 +14,10 @@ export interface SydesTelemetry {
     elapsedMs: number;
     projectIndexedThisSession?: boolean;
     projectEnsureElapsedMs?: number;
+    projectIndexElapsedMs?: number;
+    projectReadinessWaitMs?: number;
+    projectReadinessPollCount?: number;
+    projectReadinessStrategy?: string;
   };
   impactGuidanceCount: number;
   impactGuidanceEvents: Array<{
@@ -63,7 +67,11 @@ export class SydesTelemetryRecorder {
       queryCount: context.querySummary.queryCount,
       elapsedMs: context.querySummary.elapsedMs,
       projectIndexedThisSession: context.projectIndexedThisSession,
-      projectEnsureElapsedMs: context.projectEnsureElapsedMs
+      projectEnsureElapsedMs: context.projectEnsureElapsedMs,
+      projectIndexElapsedMs: context.projectIndexElapsedMs,
+      projectReadinessWaitMs: context.projectReadinessWaitMs,
+      projectReadinessPollCount: context.projectReadinessPollCount,
+      projectReadinessStrategy: context.projectReadinessStrategy
     };
     this.data.cbmProcessStartCount = context.querySummary.processStartCount ?? this.data.cbmProcessStartCount;
     this.data.cbmTransport = context.querySummary.transport ?? this.data.cbmTransport;

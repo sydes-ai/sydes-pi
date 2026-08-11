@@ -117,6 +117,79 @@ describe("Phase 1 exploration policy", () => {
     expect(client.indexRepository).toHaveBeenCalledTimes(1);
   });
 
+  it("fresh index polls until the exact project is query-visible", async () => {
+    const unseen = "/tmp/pokemon-api-fresh";
+    let time = 0;
+    const client = makeClient({
+      listProjects: vi
+        .fn()
+        .mockResolvedValueOnce(envelope({ projects: [] }))
+        .mockResolvedValue(envelope({ projects: [{ name: "fresh-project", root_path: unseen }] })),
+      indexRepository: vi.fn(async () => envelope({ project: "fresh-project" })),
+      indexStatus: vi.fn(async () => envelope({ project: "fresh-project", status: "ready", nodes: 42, edges: 84, root_path: unseen })),
+      searchGraphByArgs: vi
+        .fn()
+        .mockResolvedValueOnce(envelope({ cols: ["qn"], rows: [], total: 0 }))
+        .mockResolvedValue(envelope({ cols: ["qn"], rows: [["fresh-project.pkg.handler.addPokemon"]], total: 1 }))
+    });
+    const resolution = await ensureProjectForRepo(unseen, client, {
+      allowIndex: true,
+      readinessProbeQuery: "AddPokemon",
+      now: () => (time += 25),
+      sleep: async () => undefined
+    });
+    expect(resolution.project?.name).toBe("fresh-project");
+    expect(resolution.readinessStrategy).toBe("index_status+probe");
+    expect(resolution.readinessPollCount).toBe(2);
+  });
+
+  it("times out readiness within the bounded retry window", async () => {
+    const unseen = "/tmp/pokemon-api-timeout";
+    let time = 0;
+    const client = makeClient({
+      listProjects: vi
+        .fn()
+        .mockResolvedValueOnce(envelope({ projects: [] }))
+        .mockResolvedValue(envelope({ projects: [{ name: "timeout-project", root_path: unseen }] })),
+      indexRepository: vi.fn(async () => envelope({ project: "timeout-project" })),
+      indexStatus: vi.fn(async () => envelope({ project: "timeout-project", status: "indexing", nodes: 0, edges: 0, root_path: unseen })),
+      searchGraphByArgs: vi.fn(async () => envelope({ cols: ["qn"], rows: [], total: 0 }))
+    });
+    const resolution = await ensureProjectForRepo(unseen, client, {
+      allowIndex: true,
+      readinessProbeQuery: "AddPokemon",
+      readinessTimeoutMs: 75,
+      now: () => (time += 25),
+      sleep: async () => undefined
+    });
+    expect(resolution.readinessStrategy).toContain("timeout");
+    expect(resolution.readinessPollCount).toBeGreaterThan(0);
+  });
+
+  it("uses index_status for an existing ready repo without indexing", async () => {
+    const client = makeClient({
+      indexRepository: vi.fn(),
+      indexStatus: vi.fn(async () => envelope({ project: projectName, status: "ready", nodes: 12, edges: 34, root_path: repoPath }))
+    });
+    const resolution = await ensureProjectForRepo(repoPath, client, { allowIndex: true });
+    expect(resolution.indexedThisSession).toBe(false);
+    expect(resolution.readinessStrategy).toBe("index_status");
+    expect(resolution.readinessPollCount).toBe(1);
+    expect(client.indexRepository).not.toHaveBeenCalled();
+  });
+
+  it("reuses the ready project cache without re-polling readiness", async () => {
+    const client = makeClient({
+      indexStatus: vi.fn(async () => envelope({ project: projectName, status: "ready", nodes: 12, edges: 34, root_path: repoPath }))
+    });
+    const cache = new Map();
+    await ensureProjectForRepo(repoPath, client, { allowIndex: true, cache });
+    const second = await ensureProjectForRepo(repoPath, client, { allowIndex: true, cache });
+    expect(second.readinessStrategy).toBe("index_status");
+    expect(client.indexStatus).toHaveBeenCalledTimes(1);
+    expect(client.listProjects).toHaveBeenCalledTimes(1);
+  });
+
   it("does not choose an ambiguous basename project for a different worktree", async () => {
     const client = makeClient({
       listProjects: vi.fn(async () =>

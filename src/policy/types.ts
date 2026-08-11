@@ -18,6 +18,10 @@ export interface RelevantContext {
   task: string;
   projectIndexedThisSession?: boolean;
   projectEnsureElapsedMs?: number;
+  projectIndexElapsedMs?: number;
+  projectReadinessWaitMs?: number;
+  projectReadinessPollCount?: number;
+  projectReadinessStrategy?: string;
   entryPoints: RelevantSymbol[];
   relatedSymbols: RelevantSymbol[];
   files: string[];
@@ -42,6 +46,9 @@ export interface CbmProject {
   name: string;
   root_path?: string;
   rootPath?: string;
+  nodes?: number;
+  edges?: number;
+  status?: string;
 }
 
 export interface PolicyCbmClient {
@@ -49,6 +56,7 @@ export interface PolicyCbmClient {
   readonly processStartCount?: number;
   listProjects(): Promise<{ parsed: unknown }>;
   indexRepository?(repoPath: string, name?: string): Promise<{ parsed: unknown }>;
+  indexStatus?(project: string, verbose?: boolean): Promise<{ parsed: unknown }>;
   searchGraphByArgs(args: Record<string, string | number | boolean | readonly (string | number | boolean)[] | undefined>): Promise<{ parsed: unknown }>;
   searchCode(project: string, pattern: string): Promise<{ parsed: unknown }>;
   tracePath(project: string, functionName: string): Promise<{ parsed: unknown }>;
@@ -60,6 +68,10 @@ export interface ProjectEnsureCacheEntry {
   project: CbmProject | null;
   indexedThisSession: boolean;
   ensureElapsedMs: number;
+  indexElapsedMs?: number;
+  readinessWaitMs?: number;
+  readinessPollCount?: number;
+  readinessStrategy?: string;
   reason?: string;
 }
 
@@ -68,6 +80,11 @@ export interface ProjectEnsureOptions {
   cache?: Map<string, ProjectEnsureCacheEntry>;
   now?: () => number;
   resolveRepoRoot?: (repoPath: string) => Promise<string>;
+  readinessProbeQuery?: string;
+  readinessTimeoutMs?: number;
+  readinessInitialDelayMs?: number;
+  readinessMaxDelayMs?: number;
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export interface BuildRelevantContextOptions {
@@ -75,6 +92,10 @@ export interface BuildRelevantContextOptions {
   projectCache?: Map<string, ProjectEnsureCacheEntry>;
   now?: () => number;
   resolveRepoRoot?: (repoPath: string) => Promise<string>;
+  readinessTimeoutMs?: number;
+  readinessInitialDelayMs?: number;
+  readinessMaxDelayMs?: number;
+  sleep?: (ms: number) => Promise<void>;
 }
 
 export interface ProjectResolution {
@@ -83,6 +104,10 @@ export interface ProjectResolution {
   repoRoot?: string;
   indexedThisSession?: boolean;
   ensureElapsedMs?: number;
+  indexElapsedMs?: number;
+  readinessWaitMs?: number;
+  readinessPollCount?: number;
+  readinessStrategy?: string;
 }
 
 export interface AffectedSymbol {

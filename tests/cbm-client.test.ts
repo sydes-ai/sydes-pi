@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { CbmClient, serializeArgs } from "../src/cbm/client.js";
+import type { CbmTransport } from "../src/cbm/types.js";
 
 describe("serializeArgs", () => {
   it("serializes primitive, array, and true boolean flags", () => {
@@ -29,5 +30,32 @@ describe("CbmClient", () => {
     const client = new CbmClient({ bin: "/tmp/codebase-memory-mcp" });
 
     expect(client.bin).toBe("/tmp/codebase-memory-mcp");
+  });
+
+  it("invalidates list_projects cache after indexing a fresh repo", async () => {
+    const calls: string[] = [];
+    const transport: CbmTransport = {
+      kind: "mock",
+      processStartCount: 1,
+      callTool: async <T,>(tool: string) => {
+        calls.push(tool);
+        return {
+          command: tool,
+          args: [],
+          stdout: "{}",
+          stderr: "",
+          parsed: { structuredContent: { projects: [] } } as T
+        };
+      },
+      close: vi.fn()
+    };
+    const client = new CbmClient({ transport });
+
+    await client.listProjects();
+    await client.listProjects();
+    await client.indexRepository("/tmp/fresh");
+    await client.listProjects();
+
+    expect(calls).toEqual(["list_projects", "index_repository", "list_projects"]);
   });
 });

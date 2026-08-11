@@ -134,6 +134,10 @@ export async function analyzeSession(input: AnalyzerInput): Promise<Record<strin
       cbmFallbackUsed: !!sydes.cbmFallbackUsed,
       projectIndexedThisSession: !!sydes.explorationContext?.projectIndexedThisSession,
       projectEnsureElapsedMs: sydes.explorationContext?.projectEnsureElapsedMs ?? null,
+      projectIndexElapsedMs: sydes.explorationContext?.projectIndexElapsedMs ?? null,
+      projectReadinessWaitMs: sydes.explorationContext?.projectReadinessWaitMs ?? null,
+      projectReadinessPollCount: sydes.explorationContext?.projectReadinessPollCount ?? null,
+      projectReadinessStrategy: sydes.explorationContext?.projectReadinessStrategy ?? null,
       impactInjectionHook: sydes.impactGuidanceEvents?.at?.(-1)?.injectionHook ?? null,
       impactGuidanceSuppressedAsAlreadyVerified: !!sydes.impactGuidanceEvents?.some?.((event: any) => event.suppressedAsAlreadyVerified),
       impactGuidanceInjectedBeforeNextModelTurn: !!sydes.impactGuidanceEvents?.some?.((event: any) => event.injectedBeforeNextModelTurn)

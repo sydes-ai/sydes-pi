@@ -41,6 +41,13 @@ export class CbmClient {
     });
   }
 
+  indexStatus(project: string, verbose = true): Promise<CbmCommandResult> {
+    return this.run("index_status", {
+      project,
+      verbose
+    });
+  }
+
   searchGraph(project: string, query: string): Promise<CbmCommandResult> {
     return this.run("search_graph", {
       project,

@@ -67,6 +67,20 @@ interface TraceRows {
   callers?: SearchRows;
 }
 
+interface IndexStatus {
+  project?: string;
+  nodes?: number;
+  edges?: number;
+  status?: string;
+  root_path?: string;
+  rootPath?: string;
+  git?: {
+    canonical_root?: string;
+    worktree_root?: string;
+    root_exists?: boolean;
+  };
+}
+
 export function extractHttpRoutes(task: string): string[] {
   return unique(
     (task.match(/\/[A-Za-z0-9._~:/?#[\]@!$&'()*+,;=%-]+/g) ?? []).map((route) =>
@@ -122,7 +136,7 @@ export async function resolveCbmProject(
 
 export async function ensureProjectForRepo(
   repoPath: string,
-  cbmClient: Pick<PolicyCbmClient, "listProjects" | "indexRepository">,
+  cbmClient: Pick<PolicyCbmClient, "listProjects" | "indexRepository" | "indexStatus" | "searchGraphByArgs">,
   options: ProjectEnsureOptions = {}
 ): Promise<ProjectResolution> {
   const startedAt = options.now?.() ?? performance.now();
@@ -134,7 +148,11 @@ export async function ensureProjectForRepo(
       repoRoot,
       reason: cached.reason,
       indexedThisSession: cached.indexedThisSession,
-      ensureElapsedMs: cached.ensureElapsedMs
+      ensureElapsedMs: cached.ensureElapsedMs,
+      indexElapsedMs: cached.indexElapsedMs,
+      readinessWaitMs: cached.readinessWaitMs,
+      readinessPollCount: cached.readinessPollCount,
+      readinessStrategy: cached.readinessStrategy ?? "cached"
     };
   }
 
@@ -142,10 +160,16 @@ export async function ensureProjectForRepo(
     resolveRepoRoot: async () => repoRoot
   });
   let indexedThisSession = false;
+  let indexElapsedMs: number | undefined;
+  let readinessWaitMs = 0;
+  let readinessPollCount = 0;
+  let readinessStrategy = resolution.project ? "existing" : "unresolved";
 
   if (!resolution.project && options.allowIndex && cbmClient.indexRepository) {
     try {
+      const indexStartedAt = options.now?.() ?? performance.now();
       await cbmClient.indexRepository(repoRoot);
+      indexElapsedMs = Math.round((options.now?.() ?? performance.now()) - indexStartedAt);
       indexedThisSession = true;
       resolution = await resolveCbmProject(repoRoot, cbmClient, {
         resolveRepoRoot: async () => repoRoot
@@ -159,21 +183,172 @@ export async function ensureProjectForRepo(
     }
   }
 
+  if (resolution.project) {
+    const readiness = await waitForProjectReadiness(resolution.project, repoRoot, cbmClient, {
+      ...options,
+      requireProbe: indexedThisSession
+    });
+    readinessWaitMs = readiness.waitMs;
+    readinessPollCount = readiness.pollCount;
+    readinessStrategy = readiness.strategy;
+  }
+
   const ensureElapsedMs = Math.round((options.now?.() ?? performance.now()) - startedAt);
   const result: ProjectResolution = {
     ...resolution,
     repoRoot,
     indexedThisSession,
-    ensureElapsedMs
+    ensureElapsedMs,
+    indexElapsedMs,
+    readinessWaitMs,
+    readinessPollCount,
+    readinessStrategy
   };
   options.cache?.set(repoRoot, {
     repoRoot,
     project: result.project,
     indexedThisSession,
     ensureElapsedMs,
+    indexElapsedMs,
+    readinessWaitMs,
+    readinessPollCount,
+    readinessStrategy,
     reason: result.reason
   });
   return result;
+}
+
+async function waitForProjectReadiness(
+  project: CbmProject,
+  repoRoot: string,
+  cbmClient: Pick<PolicyCbmClient, "indexStatus" | "searchGraphByArgs">,
+  options: ProjectEnsureOptions & { requireProbe?: boolean }
+): Promise<{ waitMs: number; pollCount: number; strategy: string }> {
+  const startedAt = options.now?.() ?? performance.now();
+  const timeoutMs = options.readinessTimeoutMs ?? 5_000;
+  const initialDelayMs = options.readinessInitialDelayMs ?? 50;
+  const maxDelayMs = options.readinessMaxDelayMs ?? 250;
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolveSleep) => setTimeout(resolveSleep, ms)));
+  let delayMs = initialDelayMs;
+  let pollCount = 0;
+  let lastStrategy = "metadata";
+
+  while (true) {
+    pollCount += 1;
+    const statusReady = await isIndexStatusReady(project.name, repoRoot, cbmClient);
+    if (statusReady.ready) {
+      lastStrategy = statusReady.strategy;
+      const probeReady =
+        !options.requireProbe || !options.readinessProbeQuery
+          ? { ready: true, strategy: lastStrategy }
+          : await isProbeReady(project.name, options.readinessProbeQuery, cbmClient);
+      if (probeReady.ready) {
+        return {
+          waitMs: Math.round((options.now?.() ?? performance.now()) - startedAt),
+          pollCount,
+          strategy: probeReady.strategy === "probe" ? `${lastStrategy}+probe` : lastStrategy
+        };
+      }
+      lastStrategy = `${lastStrategy}+probe_pending`;
+    } else if (statusReady.strategy !== "index_status_unavailable") {
+      lastStrategy = statusReady.strategy;
+    } else if (!options.requireProbe && hasProjectMetadata(project)) {
+      return {
+        waitMs: Math.round((options.now?.() ?? performance.now()) - startedAt),
+        pollCount,
+        strategy: "list_projects_metadata"
+      };
+    } else if (options.readinessProbeQuery) {
+      const probeReady = await isProbeReady(project.name, options.readinessProbeQuery, cbmClient);
+      if (probeReady.ready) {
+        return {
+          waitMs: Math.round((options.now?.() ?? performance.now()) - startedAt),
+          pollCount,
+          strategy: "probe"
+        };
+      }
+      if (!options.requireProbe) {
+        return {
+          waitMs: Math.round((options.now?.() ?? performance.now()) - startedAt),
+          pollCount,
+          strategy: probeReady.strategy
+        };
+      }
+      lastStrategy = "probe_pending";
+    } else {
+      return {
+        waitMs: Math.round((options.now?.() ?? performance.now()) - startedAt),
+        pollCount,
+        strategy: "no_readiness_signal"
+      };
+    }
+
+    const elapsedMs = (options.now?.() ?? performance.now()) - startedAt;
+    if (elapsedMs >= timeoutMs) {
+      return {
+        waitMs: Math.round(elapsedMs),
+        pollCount,
+        strategy: `timeout:${lastStrategy}`
+      };
+    }
+    await sleep(Math.min(delayMs, timeoutMs - elapsedMs));
+    delayMs = Math.min(maxDelayMs, Math.ceil(delayMs * 1.7));
+  }
+}
+
+async function isIndexStatusReady(
+  projectName: string,
+  repoRoot: string,
+  cbmClient: Pick<PolicyCbmClient, "indexStatus">
+): Promise<{ ready: boolean; strategy: string }> {
+  if (!cbmClient.indexStatus) {
+    return { ready: false, strategy: "index_status_unavailable" };
+  }
+  try {
+    const response = await cbmClient.indexStatus(projectName, true);
+    const status = unwrapStructured<IndexStatus>(response.parsed);
+    if (!status) {
+      return { ready: false, strategy: "index_status_empty" };
+    }
+    const statusRoot = status.root_path ?? status.rootPath ?? status.git?.canonical_root ?? status.git?.worktree_root;
+    const rootMatches = statusRoot ? (await safeRealpath(statusRoot)) === repoRoot : true;
+    const hasGraph = typeof status.nodes === "number" && status.nodes > 0 && typeof status.edges === "number" && status.edges > 0;
+    const namedReady = !status.status || ["ready", "completed", "complete"].includes(status.status.toLowerCase());
+    return {
+      ready: rootMatches && namedReady && hasGraph,
+      strategy: "index_status"
+    };
+  } catch {
+    return { ready: false, strategy: "index_status_unavailable" };
+  }
+}
+
+async function isProbeReady(
+  projectName: string,
+  query: string,
+  cbmClient: Pick<PolicyCbmClient, "searchGraphByArgs">
+): Promise<{ ready: boolean; strategy: string }> {
+  try {
+    const response = await cbmClient.searchGraphByArgs({
+      project: projectName,
+      query,
+      limit: 1
+    });
+    const rows = rowsFromSearch(unwrapStructured<SearchRows>(response.parsed) ?? undefined);
+    return { ready: rows.length > 0, strategy: "probe" };
+  } catch {
+    return { ready: false, strategy: "probe_error" };
+  }
+}
+
+function hasProjectMetadata(project: CbmProject): boolean {
+  return (
+    typeof project.nodes === "number" &&
+    project.nodes > 0 &&
+    typeof project.edges === "number" &&
+    project.edges > 0 &&
+    (!project.status || ["ready", "completed", "complete"].includes(project.status.toLowerCase()))
+  );
 }
 
 export async function buildRelevantContext(
@@ -187,12 +362,20 @@ export async function buildRelevantContext(
   const calls: Array<{ name: string; elapsedMs: number; transport?: string }> = [];
 
   try {
+    const routes = extractHttpRoutes(task);
+    const identifiers = extractTaskIdentifiers(task);
+    const symbolQuery = buildSymbolQuery(identifiers, routes);
     const resolution = await timed(calls, "ensure_project", () =>
       ensureProjectForRepo(repoPath, cbmClient, {
         allowIndex: options.allowIndex,
         cache: options.projectCache,
         now: options.now,
-        resolveRepoRoot: options.resolveRepoRoot
+        resolveRepoRoot: options.resolveRepoRoot,
+        readinessProbeQuery: symbolQuery,
+        readinessTimeoutMs: options.readinessTimeoutMs,
+        readinessInitialDelayMs: options.readinessInitialDelayMs,
+        readinessMaxDelayMs: options.readinessMaxDelayMs,
+        sleep: options.sleep
       })
     );
     if (!resolution.project) {
@@ -201,8 +384,6 @@ export async function buildRelevantContext(
 
     const project = resolution.project.name;
     const repoRoot = resolution.repoRoot ?? repoPath;
-    const routes = extractHttpRoutes(task);
-    const identifiers = extractTaskIdentifiers(task);
     const candidates: RelevantSymbol[] = [];
     const relationships: RelevantRelationship[] = [];
 
@@ -223,7 +404,6 @@ export async function buildRelevantContext(
       }
     }
 
-    const symbolQuery = buildSymbolQuery(identifiers, routes);
     if (symbolQuery) {
       queryCount += 1;
       const symbolSearch = await timed(calls, "symbol search_graph", () => cbmClient.searchGraphByArgs({
@@ -292,6 +472,10 @@ export async function buildRelevantContext(
       task,
       projectIndexedThisSession: resolution.indexedThisSession,
       projectEnsureElapsedMs: resolution.ensureElapsedMs,
+      projectIndexElapsedMs: resolution.indexElapsedMs,
+      projectReadinessWaitMs: resolution.readinessWaitMs,
+      projectReadinessPollCount: resolution.readinessPollCount,
+      projectReadinessStrategy: resolution.readinessStrategy,
       entryPoints,
       relatedSymbols,
       files,

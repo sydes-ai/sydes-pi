@@ -46,6 +46,10 @@ async function main(): Promise<void> {
     console.log(`resolved project: ${context.project}`);
     console.log(`indexedThisSession: ${context.projectIndexedThisSession ? "yes" : "no"}`);
     console.log(`project ensure elapsed ms: ${context.projectEnsureElapsedMs ?? "n/a"}`);
+    console.log(`project index elapsed ms: ${context.projectIndexElapsedMs ?? "n/a"}`);
+    console.log(`readiness wait ms: ${context.projectReadinessWaitMs ?? "n/a"}`);
+    console.log(`readiness polls: ${context.projectReadinessPollCount ?? "n/a"}`);
+    console.log(`readiness strategy: ${context.projectReadinessStrategy ?? "n/a"}`);
     console.log(`context query elapsed ms: ${context.querySummary.elapsedMs}`);
     console.log(`entry points: ${context.entryPoints.map((symbol) => `${symbol.filePath}:${symbol.name}`).join(", ")}`);
     console.log(`files: ${context.files.join(", ")}`);

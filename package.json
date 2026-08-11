@@ -10,10 +10,12 @@
     "check": "npm run build && npm test",
     "smoke:cbm": "vite-node scripts/smoke-cbm.ts",
     "smoke:cbm-latency": "vite-node scripts/smoke-cbm-latency.ts",
+    "smoke:cbm-readiness": "vite-node scripts/smoke-cbm-readiness.ts",
     "smoke:impact": "vite-node scripts/smoke-impact.ts",
     "smoke:policy": "vite-node scripts/smoke-policy.ts",
     "smoke:worktree-policy": "vite-node scripts/smoke-worktree-policy.ts",
-    "smoke:pi": "vite-node scripts/smoke-pi.ts"
+    "smoke:pi": "vite-node scripts/smoke-pi.ts",
+    "live:sydes": "vite-node scripts/run-live-sydes.ts"
   },
   "keywords": [
     "sydes",

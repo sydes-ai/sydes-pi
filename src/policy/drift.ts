@@ -49,14 +49,18 @@ export function analyzeChangeSurfaceDrift(input: {
   affectedContext?: AffectedContext | null;
   diffText: string;
   sourceSymbols?: SourceSymbolRange[];
+  preEditSymbols?: SourceSymbolRange[];
+  postEditSymbols?: SourceSymbolRange[];
 }): ChangeSurfaceDrift {
   const relevant = input.relevantContext;
   const files = parseUnifiedDiff(input.diffText);
   const changedFiles = unique(files.map((file) => file.newPath));
   const expectedFiles = expectedEditFiles(relevant);
   const expectedSymbolNames = expectedEditSymbolNames(relevant);
-  const sourceSymbols = input.sourceSymbols ?? symbolsFromRelevantContext(relevant);
-  const symbolChanges = collectChangedSymbols(files, sourceSymbols);
+  const fallbackSymbols = input.sourceSymbols ?? symbolsFromRelevantContext(relevant);
+  const preEditSymbols = input.preEditSymbols ?? fallbackSymbols;
+  const postEditSymbols = input.postEditSymbols ?? fallbackSymbols;
+  const symbolChanges = collectChangedSymbols(files, { preEditSymbols, postEditSymbols });
   const expectedChangedSymbols = symbolChanges.filter((symbol) =>
     isExpectedSymbol(symbol, expectedSymbolNames, expectedFiles)
   );
@@ -231,15 +235,18 @@ export async function loadSourceSymbolsForDiff(
   }
 }
 
-function collectChangedSymbols(files: ParsedFileDiff[], sourceSymbols: SourceSymbolRange[]): ChangedSymbol[] {
+function collectChangedSymbols(
+  files: ParsedFileDiff[],
+  symbols: { preEditSymbols: SourceSymbolRange[]; postEditSymbols: SourceSymbolRange[] }
+): ChangedSymbol[] {
   const byKey = new Map<string, ChangedSymbol>();
   for (const file of files) {
     for (const hunk of file.hunks) {
-      const fallbackName = symbolNameFromHunk(hunk) ?? "(file scope)";
       for (const change of hunk.changes) {
         const line = change.kind === "delete" ? change.oldLine : change.newLine;
-        const symbol = line ? findContainingSymbol(file.newPath, line, sourceSymbols) : null;
-        const name = symbol?.name ?? symbolNameFromLine(change.text) ?? fallbackName;
+        const lookup = change.kind === "delete" ? symbols.preEditSymbols : symbols.postEditSymbols;
+        const symbol = line ? findContainingSymbol(file.newPath, line, lookup) : null;
+        const name = symbol?.name ?? symbolNameFromLine(change.text) ?? "(file scope)";
         const qualifiedName = symbol?.qualifiedName;
         const key = `${file.newPath}:${qualifiedName ?? name}`;
         const current = byKey.get(key) ?? {

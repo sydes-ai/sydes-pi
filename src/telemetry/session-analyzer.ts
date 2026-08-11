@@ -1,5 +1,6 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { canonicalRepoRelativePath } from "../policy/paths.js";
+import type { RepositoryAction } from "../policy/types.js";
 
 interface AnalyzerInput {
   sessionPath: string;
@@ -72,7 +73,10 @@ export async function analyzeSession(input: AnalyzerInput): Promise<Record<strin
   const first3Hits = first3.filter((path) => priority.has(path));
   const first5Hits = first5.filter((path) => priority.has(path));
   const first10Hits = first10.filter((path) => priority.has(path));
-  const agentTestRuns = calls.filter((call) => call.name === "bash" && /go\s+test/.test(String((call.args as any)?.command ?? "")));
+  const relevanceTerms = taskRelevanceTerms(sydes, priority);
+  const repositoryActions = collectRepositoryActions(calls, input.repoRoot, priority, relevanceTerms);
+  const firstTaskRelevantAction = repositoryActions.find((action) => action.taskRelevant) ?? null;
+  const agentTestRuns = calls.filter((call) => call.name === "bash" && /go\s+test/.test(String(decodeArgs(call.args)?.command ?? "")));
   const agentTestIds = new Set(agentTestRuns.map((call) => call.id));
   const agentTestResults = results.filter((result) => agentTestIds.has(result.id));
   const usage = aggregateUsage(entries);
@@ -116,7 +120,10 @@ export async function analyzeSession(input: AnalyzerInput): Promise<Record<strin
       first5PriorityHitRate: first5.length ? first5Hits.length / first5.length : null,
       first10PriorityHits: first10Hits,
       first10PriorityHitRate: first10.length ? first10Hits.length / first10.length : null,
-      firstPriorityReadTurn: firstPriorityReadTurn(calls, input.repoRoot, priority)
+      firstPriorityReadTurn: firstPriorityReadTurn(calls, input.repoRoot, priority),
+      firstRepositoryAction: repositoryActions[0] ?? null,
+      firstRepositoryActions: repositoryActions.slice(0, 10),
+      firstTaskRelevantActionTurn: firstTaskRelevantAction?.turn ?? null
     },
     editing: {
       firstEditFile: firstEdit?.file ?? null,
@@ -312,6 +319,154 @@ function readPathsForCall(call: ToolCall, repoRoot: string): string[] {
   return [...paths];
 }
 
+function collectRepositoryActions(
+  calls: ToolCall[],
+  repoRoot: string,
+  priority: Set<string>,
+  relevanceTerms: Set<string>
+): RepositoryAction[] {
+  return calls
+    .map((call) => repositoryActionForCall(call, repoRoot, priority, relevanceTerms))
+    .filter((action): action is RepositoryAction => !!action);
+}
+
+export function repositoryActionForCall(
+  call: ToolCall,
+  repoRoot: string,
+  priority: Set<string>,
+  relevanceTerms: Set<string>
+): RepositoryAction | null {
+  const args = decodeArgs(call.args);
+  if (call.name === "read") {
+    const target = normalizePath(repoRoot, typeof args?.path === "string" ? args.path : undefined);
+    return target
+      ? {
+          type: "read",
+          toolName: call.name,
+          turn: call.turn,
+          target,
+          taskRelevant: priority.has(target)
+        }
+      : null;
+  }
+  if (call.name === "edit" || call.name === "write") {
+    const target = normalizePath(repoRoot, typeof args?.path === "string" ? args.path : undefined);
+    return {
+      type: call.name,
+      toolName: call.name,
+      turn: call.turn,
+      target,
+      taskRelevant: !!target && priority.has(target)
+    };
+  }
+  if (call.name === "bash") {
+    const command = String(args?.command ?? "");
+    const search = parseSearchCommand(command);
+    if (search) {
+      return {
+        type: "search",
+        toolName: call.name,
+        turn: call.turn,
+        query: search.query,
+        target: search.target,
+        taskRelevant: isSearchRelevant(search.query, search.target, priority, relevanceTerms)
+      };
+    }
+    return {
+      type: "bash",
+      toolName: call.name,
+      turn: call.turn,
+      target: command.slice(0, 160),
+      taskRelevant: readPathsForCall(call, repoRoot).some((path) => priority.has(path))
+    };
+  }
+  return {
+    type: "other",
+    toolName: call.name,
+    turn: call.turn,
+    taskRelevant: false
+  };
+}
+
+function parseSearchCommand(command: string): { query: string; target?: string } | null {
+  const match = command.match(/\b(?:rg|grep)\b\s+(.+)/);
+  if (!match) {
+    return null;
+  }
+  const tokens = shellishTokens(match[1]);
+  const nonOptions = tokens.filter((token) => !token.startsWith("-"));
+  const query = nonOptions[0]?.replace(/^['"]|['"]$/g, "");
+  const target = nonOptions.slice(1).join(" ") || undefined;
+  return query ? { query, target } : { query: match[1].slice(0, 160) };
+}
+
+function shellishTokens(text: string): string[] {
+  return Array.from(text.matchAll(/"([^"]*)"|'([^']*)'|(\S+)/g), (match) => match[1] ?? match[2] ?? match[3]);
+}
+
+function isSearchRelevant(
+  query: string,
+  target: string | undefined,
+  priority: Set<string>,
+  relevanceTerms: Set<string>
+): boolean {
+  const haystack = `${query} ${target ?? ""}`.toLowerCase();
+  if ([...priority].some((path) => haystack.includes(path.toLowerCase()))) {
+    return true;
+  }
+  if ([...relevanceTerms].some((term) => term.length >= 3 && haystack.includes(term))) {
+    return true;
+  }
+  return tokensForRelevance(haystack).some((token) => relevanceTerms.has(token));
+}
+
+function taskRelevanceTerms(sydes: any, priority: Set<string>): Set<string> {
+  const terms = new Set<string>();
+  for (const path of priority) {
+    for (const token of tokensForRelevance(path)) {
+      terms.add(token);
+    }
+  }
+  const symbols = [
+    ...(sydes.explorationContext?.entryPoints ?? []),
+    ...(sydes.explorationContext?.relatedSymbols ?? [])
+  ];
+  for (const symbol of symbols) {
+    for (const value of [symbol.name, symbol.qualifiedName]) {
+      addRawRelevanceTerm(terms, String(value ?? ""));
+      for (const token of tokensForRelevance(String(value ?? ""))) {
+        terms.add(token);
+      }
+    }
+  }
+  for (const relationship of sydes.explorationContext?.relationships ?? []) {
+    for (const value of [relationship.from, relationship.to]) {
+      addRawRelevanceTerm(terms, String(value ?? ""));
+      for (const token of tokensForRelevance(String(value ?? ""))) {
+        terms.add(token);
+      }
+    }
+  }
+  return terms;
+}
+
+function addRawRelevanceTerm(terms: Set<string>, value: string): void {
+  const raw = value.split(".").at(-1)?.toLowerCase();
+  if (raw && raw.length >= 3) {
+    terms.add(raw);
+  }
+}
+
+function tokensForRelevance(text: string): string[] {
+  return unique(
+    text
+      .split(/[^A-Za-z0-9_]+/)
+      .flatMap((part) => part.split(/(?=[A-Z])/))
+      .map((part) => part.toLowerCase())
+      .filter((part) => part.length >= 3)
+  );
+}
+
 function summarizeDiff(diffText: string): { files: string[]; insertions: number; deletions: number } {
   const files = [...diffText.matchAll(/^diff --git a\/(.+?) b\/(.+)$/gm)].map((match) => match[2]);
   const insertions = diffText.split("\n").filter((line) => line.startsWith("+") && !line.startsWith("+++")).length;
@@ -329,6 +484,10 @@ function countBy(values: string[]): Record<string, number> {
     acc[value] = (acc[value] ?? 0) + 1;
     return acc;
   }, {});
+}
+
+function unique<T>(values: T[]): T[] {
+  return [...new Set(values)];
 }
 
 function dedupeBy<T>(values: T[], key: (value: T) => string): T[] {

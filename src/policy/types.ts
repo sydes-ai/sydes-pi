@@ -194,3 +194,12 @@ export interface ChangeSurfaceDrift {
   reasons: string[];
   signature: string;
 }
+
+export interface RepositoryAction {
+  type: "read" | "search" | "edit" | "write" | "bash" | "other";
+  toolName: string;
+  turn: number;
+  target?: string;
+  query?: string;
+  taskRelevant: boolean;
+}

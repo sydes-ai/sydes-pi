@@ -12,7 +12,9 @@ const execFileAsync = promisify(execFile);
 
 const baseCommit = "5d6a96f373b67afddbafaa0ab7d26e61fb3bf3f0";
 const sourceRepo = resolve(process.env.HOME ?? "/Users/ksnaik", "sample_repos/pokemon-api");
-const runDir = resolve(process.env.HOME ?? "/Users/ksnaik", ".sydes-pi/runs/pokemon-api/20260811T133834Z-pokemon-sydes");
+const runsRoot = resolve(process.env.HOME ?? "/Users/ksnaik", ".sydes-pi/runs/pokemon-api");
+const badRunDir = join(runsRoot, "20260811T133834Z-pokemon-sydes");
+const cleanRunDir = join(runsRoot, "20260811T152400Z-pokemon-sydes");
 const cbmBin = resolve("node_modules/.bin/codebase-memory-mcp");
 
 async function main(): Promise<void> {
@@ -20,12 +22,8 @@ async function main(): Promise<void> {
   const worktree = join(root, "pokemon-api");
   const client = new CbmClient({ bin: cbmBin });
   try {
-    await execFileAsync("git", ["clone", "--quiet", sourceRepo, worktree]);
-    await execFileAsync("git", ["checkout", "--quiet", baseCommit], { cwd: worktree });
-    const badDiff = await readFile(join(runDir, "final.diff"), "utf8");
-    await writeFile(join(root, "bad.diff"), badDiff);
-    await execFileAsync("git", ["apply", join(root, "bad.diff")], { cwd: worktree });
-    const context = JSON.parse(await readFile(join(runDir, "preflight-context.json"), "utf8")) as RelevantContext;
+    await prepareWorktree(worktree);
+    const context = JSON.parse(await readFile(join(badRunDir, "preflight-context.json"), "utf8")) as RelevantContext;
     const resolution = await ensureProjectForRepo(worktree, client, {
       allowIndex: true,
       readinessProbeQuery: "AddPokemon Test_AddPokemon"
@@ -33,12 +31,7 @@ async function main(): Promise<void> {
     if (!resolution.project) {
       throw new Error("Could not prepare CBM project for drift replay");
     }
-    const badSymbols = await loadSourceSymbolsForDiff(resolution.project.name, resolution.repoRoot ?? worktree, client, badDiff, context);
-    const bad = analyzeChangeSurfaceDrift({
-      relevantContext: context,
-      diffText: badDiff,
-      sourceSymbols: badSymbols
-    });
+    const bad = await replaySavedDiff("bad", badRunDir, worktree, client, resolution.project.name, resolution.repoRoot ?? worktree, context, root);
     const badUnexpected = bad.unexpectedChangedSymbols.map((symbol) => symbol.name);
     if (bad.severity !== "medium" && bad.severity !== "high") {
       throw new Error(`Expected bad saved diff drift to be medium/high, got ${bad.severity}`);
@@ -49,13 +42,28 @@ async function main(): Promise<void> {
       }
     }
 
+    const clean = await replaySavedDiff("clean", cleanRunDir, worktree, client, resolution.project.name, resolution.repoRoot ?? worktree, context, root);
+    const cleanUnexpected = clean.unexpectedChangedSymbols.map((symbol) => symbol.name);
+    if (clean.severity !== "none" && clean.severity !== "low") {
+      throw new Error(`Expected latest clean diff drift to be none/low, got ${clean.severity}`);
+    }
+    if (cleanUnexpected.includes("Test_DeletePokemon")) {
+      throw new Error("Latest clean diff must not flag Test_DeletePokemon");
+    }
+    if (!clean.expectedChangedSymbols.some((symbol) => symbol.name === "Test_AddPokemon_HPZero")) {
+      throw new Error("Latest clean diff did not recognize Test_AddPokemon_HPZero as expected/new");
+    }
+
     await execFileAsync("git", ["reset", "--hard", "--quiet", baseCommit], { cwd: worktree });
     const minimalDiff = await createMinimalPokemonDiff(worktree);
-    const minimalSymbols = await loadSourceSymbolsForDiff(resolution.project.name, resolution.repoRoot ?? worktree, client, minimalDiff, context);
+    const minimalPre = await loadSourceSymbolsForDiff(resolution.project.name, resolution.repoRoot ?? worktree, client, minimalDiff, context);
+    await client.indexRepository(worktree);
+    const minimalPost = await loadSourceSymbolsForDiff(resolution.project.name, resolution.repoRoot ?? worktree, client, minimalDiff, context);
     const minimal = analyzeChangeSurfaceDrift({
       relevantContext: context,
       diffText: minimalDiff,
-      sourceSymbols: minimalSymbols
+      preEditSymbols: minimalPre,
+      postEditSymbols: minimalPost
     });
     if (minimal.severity !== "none" && minimal.severity !== "low") {
       throw new Error(`Expected minimal diff drift to be none/low, got ${minimal.severity}`);
@@ -65,6 +73,9 @@ async function main(): Promise<void> {
     console.log(`bad unexpected symbols: ${badUnexpected.join(", ")}`);
     console.log(`bad reasons: ${bad.reasons.join("; ")}`);
     console.log(`bad insertions/deletions: ${bad.insertionCount}/${bad.deletionCount}`);
+    console.log(`clean severity: ${clean.severity}`);
+    console.log(`clean unexpected symbols: ${cleanUnexpected.join(", ") || "none"}`);
+    console.log(`clean expected symbols: ${clean.expectedChangedSymbols.map((symbol) => symbol.name).join(", ") || "none"}`);
     console.log("warning:");
     console.log(buildChangeSurfaceGuidance(bad));
     console.log(`minimal severity: ${minimal.severity}`);
@@ -73,6 +84,38 @@ async function main(): Promise<void> {
     await client.close();
     await rm(root, { recursive: true, force: true });
   }
+}
+
+async function prepareWorktree(worktree: string): Promise<void> {
+  await execFileAsync("git", ["clone", "--quiet", sourceRepo, worktree]);
+  await execFileAsync("git", ["checkout", "--quiet", baseCommit], { cwd: worktree });
+}
+
+async function replaySavedDiff(
+  label: string,
+  runDir: string,
+  worktree: string,
+  client: CbmClient,
+  project: string,
+  repoRoot: string,
+  context: RelevantContext,
+  root: string
+) {
+  await execFileAsync("git", ["reset", "--hard", "--quiet", baseCommit], { cwd: worktree });
+  await client.indexRepository(worktree);
+  const diffText = await readFile(join(runDir, "final.diff"), "utf8");
+  const preEditSymbols = await loadSourceSymbolsForDiff(project, repoRoot, client, diffText, context);
+  const diffPath = join(root, `${label}.diff`);
+  await writeFile(diffPath, diffText);
+  await execFileAsync("git", ["apply", diffPath], { cwd: worktree });
+  await client.indexRepository(worktree);
+  const postEditSymbols = await loadSourceSymbolsForDiff(project, repoRoot, client, diffText, context);
+  return analyzeChangeSurfaceDrift({
+    relevantContext: context,
+    diffText,
+    preEditSymbols,
+    postEditSymbols
+  });
 }
 
 async function createMinimalPokemonDiff(worktree: string): Promise<string> {

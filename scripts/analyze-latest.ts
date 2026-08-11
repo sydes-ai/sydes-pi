@@ -29,6 +29,9 @@ async function main(): Promise<void> {
   console.log(`first5 hit rate: ${anySummary.exploration.first5PriorityHitRate}`);
   console.log(`first10 hit rate: ${anySummary.exploration.first10PriorityHitRate}`);
   console.log(`first priority read turn: ${anySummary.exploration.firstPriorityReadTurn}`);
+  console.log(`first repository action: ${JSON.stringify(anySummary.exploration.firstRepositoryAction)}`);
+  console.log(`first task relevant action turn: ${anySummary.exploration.firstTaskRelevantActionTurn}`);
+  console.log(`first repository actions: ${JSON.stringify(anySummary.exploration.firstRepositoryActions)}`);
   console.log(`turns: ${anySummary.agent.turns}`);
   console.log(`first edit turn: ${anySummary.editing.firstEditTurn}`);
   console.log(`elapsed seconds: ${anySummary.agent.elapsedSeconds}`);

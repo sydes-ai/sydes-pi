@@ -61,6 +61,60 @@ describe("change-surface drift", () => {
     });
     expect(["none", "low"]).toContain(drift.severity);
   });
+
+  it("maps append-only new symbols to the post-edit symbol, not the preceding hunk header", () => {
+    const drift = analyzeChangeSurfaceDrift({
+      relevantContext: context(),
+      diffText: appendAfterDeletePokemonDiff(),
+      preEditSymbols: symbols(),
+      postEditSymbols: [
+        ...symbols(),
+        {
+          name: "Test_AddPokemon_HPZero",
+          qualifiedName: "pokemon.pkg.handler.Test_AddPokemon_HPZero",
+          kind: "Function",
+          filePath: "pkg/handler/pokedex_test.go",
+          startLine: 349,
+          endLine: 372
+        }
+      ]
+    });
+    expect(drift.unexpectedChangedSymbols.map((symbol) => symbol.name)).not.toContain("Test_DeletePokemon");
+    expect(drift.expectedChangedSymbols.map((symbol) => symbol.name)).toContain("Test_AddPokemon_HPZero");
+    expect(["none", "low"]).toContain(drift.severity);
+  });
+
+  it("keeps insertion between symbols at file scope instead of assigning hunk header ownership", () => {
+    const drift = analyzeChangeSurfaceDrift({
+      relevantContext: context(),
+      diffText: `diff --git a/pkg/handler/pokedex_test.go b/pkg/handler/pokedex_test.go
+--- a/pkg/handler/pokedex_test.go
++++ b/pkg/handler/pokedex_test.go
+@@ -145,0 +146,1 @@ func Test_GetAll(t *testing.T) {
++var helperValue = 1
+`,
+      preEditSymbols: symbols(),
+      postEditSymbols: symbols()
+    });
+    expect(drift.expectedChangedSymbols.map((symbol) => symbol.name)).toEqual(["(file scope)"]);
+    expect([...drift.expectedChangedSymbols, ...drift.unexpectedChangedSymbols].map((symbol) => symbol.name)).not.toContain("Test_GetAll");
+  });
+
+  it("maps a true edit inside an existing symbol to that symbol", () => {
+    const drift = analyzeChangeSurfaceDrift({
+      relevantContext: context(),
+      diffText: `diff --git a/pkg/handler/pokedex_test.go b/pkg/handler/pokedex_test.go
+--- a/pkg/handler/pokedex_test.go
++++ b/pkg/handler/pokedex_test.go
+@@ -302,1 +302,1 @@ func Test_DeletePokemon(t *testing.T) {
+-				s.EXPECT().DeletePokemon(1).Return(nil)
++				s.EXPECT().DeletePokemon(2).Return(nil)
+`,
+      preEditSymbols: symbols(),
+      postEditSymbols: symbols()
+    });
+    expect(drift.unexpectedChangedSymbols.map((symbol) => symbol.name)).toContain("Test_DeletePokemon");
+  });
 });
 
 function context(): RelevantContext {
@@ -132,5 +186,22 @@ function badDiff(): string {
 @@ -302,2 +284,2 @@ func Test_DeletePokemon(t *testing.T) {
 -				s.EXPECT().DeletePokemon(1).Return(nil)
 +				 s.EXPECT().DeletePokemon(1).Return(nil)
+`;
+}
+
+function appendAfterDeletePokemonDiff(): string {
+  return `diff --git a/pkg/handler/pokedex_test.go b/pkg/handler/pokedex_test.go
+--- a/pkg/handler/pokedex_test.go
++++ b/pkg/handler/pokedex_test.go
+@@ -347,3 +347,27 @@ func Test_DeletePokemon(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func Test_AddPokemon_HPZero(t *testing.T) {
++	ctrl := gomock.NewController(t)
++	defer ctrl.Finish()
++	assert.Equal(t, http.StatusBadRequest, http.StatusBadRequest)
++}
 `;
 }

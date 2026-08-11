@@ -1,0 +1,32 @@
+{
+  "name": "sydes-pi",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Foundation for a Sydes graph-aware policy extension on the Pi harness.",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run build && npm test"
+  },
+  "keywords": [
+    "sydes",
+    "pi",
+    "codebase-memory"
+  ],
+  "license": "UNLICENSED",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.1",
+    "codebase-memory-mcp": "^0.10.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.1",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

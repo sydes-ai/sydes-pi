@@ -71,6 +71,34 @@ export class CbmClient {
       format: "json"
     });
   }
+
+  searchGraphByArgs(args: CbmArgs): Promise<CbmCommandResult> {
+    return this.run("search_graph", {
+      ...args,
+      format: args.format ?? "json"
+    });
+  }
+
+  searchCode(project: string, pattern: string): Promise<CbmCommandResult> {
+    return this.run("search_code", {
+      project,
+      pattern,
+      mode: "compact",
+      limit: 10
+    });
+  }
+
+  tracePath(project: string, functionName: string): Promise<CbmCommandResult> {
+    return this.run("trace_path", {
+      project,
+      "function-name": functionName,
+      direction: "both",
+      depth: 2,
+      "include-tests": true,
+      format: "json",
+      limit: 20
+    });
+  }
 }
 
 export function serializeArgs(args: CbmArgs): string[] {

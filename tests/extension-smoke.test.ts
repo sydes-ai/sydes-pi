@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import sydesPiExtension, { createSydesExtension } from "../src/extension.js";
 
 describe("createSydesExtension", () => {
@@ -11,6 +11,11 @@ describe("createSydesExtension", () => {
   });
 
   it("exports a Pi extension factory", () => {
-    expect(() => sydesPiExtension({} as never)).not.toThrow();
+    expect(() =>
+      sydesPiExtension({
+        registerCommand: vi.fn(),
+        on: vi.fn()
+      } as never)
+    ).not.toThrow();
   });
 });

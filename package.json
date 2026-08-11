@@ -9,6 +9,7 @@
     "test": "vitest run",
     "check": "npm run build && npm test",
     "smoke:cbm": "vite-node scripts/smoke-cbm.ts",
+    "smoke:policy": "vite-node scripts/smoke-policy.ts",
     "smoke:pi": "vite-node scripts/smoke-pi.ts"
   },
   "keywords": [

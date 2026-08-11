@@ -15,6 +15,7 @@ import {
   normalizeRepoPath as normalizeImpactPath
 } from "./policy/impact.js";
 import type { AffectedContext, RelevantContext } from "./policy/types.js";
+import { SydesTelemetryRecorder } from "./telemetry/recorder.js";
 
 export interface SydesExtensionContext {
   registerTool?: (tool: unknown) => void;
@@ -61,6 +62,7 @@ export interface SydesRuntimeState {
   impactDirty: boolean;
   pendingMutations: ObservedMutation[];
   lastImpactSignature: string | null;
+  telemetry?: SydesTelemetryRecorder;
 }
 
 export interface ObservedMutation {
@@ -78,7 +80,8 @@ export default function sydesPiExtension(pi: ExtensionAPI): void {
     impactDirty: false,
     pendingMutations: [],
     lastImpactSignature: null,
-    lastReason: null
+    lastReason: null,
+    telemetry: new SydesTelemetryRecorder()
   };
 
   pi.registerCommand("sydes-status", {
@@ -173,6 +176,8 @@ export default function sydesPiExtension(pi: ExtensionAPI): void {
     await maybeSendImpactGuidance(extension.cbm, state, ctx.cwd, pi);
   });
   pi.on("session_shutdown", async () => {
+    state.telemetry?.recordCbm(extension.cbm.processStartCount, extension.cbm.transportKind);
+    await state.telemetry?.flush();
     await extension.cbm.close();
   });
 }
@@ -196,6 +201,7 @@ export function createBeforeAgentStartHandler(cbm: CbmClient, state: SydesRuntim
     const guidance = buildExplorationGuidance(context);
     state.lastContext = context;
     state.lastReason = null;
+    state.telemetry?.recordExploration(context, guidance);
     return {
       message: {
         customType: "sydes-graph-guidance",
@@ -278,10 +284,12 @@ export async function maybeSendImpactGuidance(
   state.lastAffectedContext = affected;
   state.lastImpactSignature = affected.signature;
   state.lastReason = null;
+  const guidance = buildImpactGuidance(affected);
+  state.telemetry?.recordImpact(affected, guidance);
   pi.sendMessage(
     {
       customType: "sydes-impact-guidance",
-      content: buildImpactGuidance(affected),
+      content: guidance,
       display: true,
       details: { context: affected }
     },

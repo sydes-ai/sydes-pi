@@ -15,13 +15,14 @@ async function main(): Promise<void> {
   const tempRoot = await mkdtemp(join(tmpdir(), "sydes-impact-"));
   const repoCopy = join(tempRoot, "pokemon-api");
   const client = new CbmClient({ bin: cbmBin });
+  const projectName = `sydes-impact-smoke-${Date.now()}`;
 
   try {
     await execFileAsync("git", ["clone", "--quiet", sourceRepo, repoCopy]);
     await makeTinyMutation(repoCopy);
     await client.run("index_repository", {
       "repo-path": repoCopy,
-      name: "sydes-impact-smoke",
+      name: projectName,
       mode: "fast"
     });
     await client.warmup();

@@ -7,7 +7,9 @@
   "scripts": {
     "build": "tsc --noEmit",
     "test": "vitest run",
-    "check": "npm run build && npm test"
+    "check": "npm run build && npm test",
+    "smoke:cbm": "vite-node scripts/smoke-cbm.ts",
+    "smoke:pi": "vite-node scripts/smoke-pi.ts"
   },
   "keywords": [
     "sydes",

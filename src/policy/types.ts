@@ -16,6 +16,8 @@ export interface RelevantRelationship {
 export interface RelevantContext {
   project: string;
   task: string;
+  projectIndexedThisSession?: boolean;
+  projectEnsureElapsedMs?: number;
   entryPoints: RelevantSymbol[];
   relatedSymbols: RelevantSymbol[];
   files: string[];
@@ -53,14 +55,34 @@ export interface PolicyCbmClient {
   detectChanges(project: string): Promise<{ parsed: unknown; elapsedMs?: number; transport?: string }>;
 }
 
+export interface ProjectEnsureCacheEntry {
+  repoRoot: string;
+  project: CbmProject | null;
+  indexedThisSession: boolean;
+  ensureElapsedMs: number;
+  reason?: string;
+}
+
+export interface ProjectEnsureOptions {
+  allowIndex?: boolean;
+  cache?: Map<string, ProjectEnsureCacheEntry>;
+  now?: () => number;
+  resolveRepoRoot?: (repoPath: string) => Promise<string>;
+}
+
 export interface BuildRelevantContextOptions {
   allowIndex?: boolean;
+  projectCache?: Map<string, ProjectEnsureCacheEntry>;
   now?: () => number;
+  resolveRepoRoot?: (repoPath: string) => Promise<string>;
 }
 
 export interface ProjectResolution {
   project: CbmProject | null;
   reason?: string;
+  repoRoot?: string;
+  indexedThisSession?: boolean;
+  ensureElapsedMs?: number;
 }
 
 export interface AffectedSymbol {
@@ -86,6 +108,8 @@ export interface AffectedRelationship {
 
 export interface AffectedContext {
   project: string;
+  projectIndexedThisSession?: boolean;
+  projectEnsureElapsedMs?: number;
   changedFiles: string[];
   changedSymbols: AffectedSymbol[];
   impactedSymbols: AffectedSymbol[];

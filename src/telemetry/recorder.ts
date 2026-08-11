@@ -12,6 +12,8 @@ export interface SydesTelemetry {
     relationships: unknown[];
     queryCount: number;
     elapsedMs: number;
+    projectIndexedThisSession?: boolean;
+    projectEnsureElapsedMs?: number;
   };
   impactGuidanceCount: number;
   impactGuidanceEvents: Array<{
@@ -25,6 +27,9 @@ export interface SydesTelemetry {
     totalElapsedMs: number;
     guidanceText: string;
     guidanceSignature: string;
+    injectionHook?: string;
+    suppressedAsAlreadyVerified?: boolean;
+    injectedBeforeNextModelTurn?: boolean;
   }>;
   cbmProcessStartCount?: number;
   cbmTransport?: string;
@@ -56,7 +61,9 @@ export class SydesTelemetryRecorder {
       tests: context.tests,
       relationships: context.relationships,
       queryCount: context.querySummary.queryCount,
-      elapsedMs: context.querySummary.elapsedMs
+      elapsedMs: context.querySummary.elapsedMs,
+      projectIndexedThisSession: context.projectIndexedThisSession,
+      projectEnsureElapsedMs: context.projectEnsureElapsedMs
     };
     this.data.cbmProcessStartCount = context.querySummary.processStartCount ?? this.data.cbmProcessStartCount;
     this.data.cbmTransport = context.querySummary.transport ?? this.data.cbmTransport;
@@ -64,7 +71,15 @@ export class SydesTelemetryRecorder {
     void this.flush();
   }
 
-  recordImpact(context: AffectedContext, guidanceText: string): void {
+  recordImpact(
+    context: AffectedContext,
+    guidanceText: string,
+    options: {
+      injectionHook?: string;
+      suppressedAsAlreadyVerified?: boolean;
+      injectedBeforeNextModelTurn?: boolean;
+    } = {}
+  ): void {
     this.data.impactGuidanceCount += 1;
     this.data.impactGuidanceEvents.push({
       changedFiles: context.changedFiles,
@@ -76,12 +91,23 @@ export class SydesTelemetryRecorder {
       detectChangesElapsedMs: context.querySummary.detectChangesElapsedMs,
       totalElapsedMs: context.querySummary.elapsedMs,
       guidanceText,
-      guidanceSignature: context.signature
+      guidanceSignature: context.signature,
+      injectionHook: options.injectionHook,
+      suppressedAsAlreadyVerified: options.suppressedAsAlreadyVerified,
+      injectedBeforeNextModelTurn: options.injectedBeforeNextModelTurn
     });
     this.data.cbmProcessStartCount = context.querySummary.processStartCount ?? this.data.cbmProcessStartCount;
     this.data.cbmTransport = context.querySummary.transport ?? this.data.cbmTransport;
     this.data.cbmFallbackUsed = (context.querySummary.transport ?? "").includes("fallback") || this.data.cbmFallbackUsed;
     void this.flush();
+  }
+
+  recordImpactSuppressed(context: AffectedContext, guidanceText: string, injectionHook: string): void {
+    this.recordImpact(context, guidanceText, {
+      injectionHook,
+      suppressedAsAlreadyVerified: true,
+      injectedBeforeNextModelTurn: false
+    });
   }
 
   recordCbm(cbmProcessStartCount: number, cbmTransport: string): void {

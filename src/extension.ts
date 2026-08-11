@@ -1,6 +1,7 @@
 import type {
   BeforeAgentStartEvent,
   BeforeAgentStartEventResult,
+  ContextEvent,
   ExtensionAPI,
   ExtensionContext,
   ToolResultEvent
@@ -8,13 +9,14 @@ import type {
 import { CbmClient } from "./cbm/client.js";
 import { findExecutable } from "./cbm/paths.js";
 import { loadConfig } from "./config.js";
-import { buildExplorationGuidance, buildRelevantContext, resolveCbmProject } from "./policy/exploration.js";
+import { buildExplorationGuidance, buildRelevantContext, ensureProjectForRepo } from "./policy/exploration.js";
 import {
   buildAffectedContext,
   buildImpactGuidance,
   normalizeRepoPath as normalizeImpactPath
 } from "./policy/impact.js";
 import type { AffectedContext, RelevantContext } from "./policy/types.js";
+import type { ProjectEnsureCacheEntry } from "./policy/types.js";
 import { SydesTelemetryRecorder } from "./telemetry/recorder.js";
 
 export interface SydesExtensionContext {
@@ -61,13 +63,22 @@ export interface SydesRuntimeState {
   lastReason: string | null;
   impactDirty: boolean;
   pendingMutations: ObservedMutation[];
+  testCommandsAfterLastMutation: ObservedTestCommand[];
   lastImpactSignature: string | null;
+  projectCache: Map<string, ProjectEnsureCacheEntry>;
+  impactInjectionBoundary: "context";
   telemetry?: SydesTelemetryRecorder;
 }
 
 export interface ObservedMutation {
   filePath: string;
   toolName: "edit" | "write";
+  timestamp: number;
+  toolCallId: string;
+}
+
+export interface ObservedTestCommand {
+  command: string;
   timestamp: number;
   toolCallId: string;
 }
@@ -79,8 +90,11 @@ export default function sydesPiExtension(pi: ExtensionAPI): void {
     lastAffectedContext: null,
     impactDirty: false,
     pendingMutations: [],
+    testCommandsAfterLastMutation: [],
     lastImpactSignature: null,
     lastReason: null,
+    projectCache: new Map(),
+    impactInjectionBoundary: "context",
     telemetry: new SydesTelemetryRecorder()
   };
 
@@ -88,8 +102,12 @@ export default function sydesPiExtension(pi: ExtensionAPI): void {
     description: "Show Sydes graph policy status",
     handler: async (_args, ctx) => {
       const cbmPath = await findExecutable(extension.cbm.bin);
-      const resolution = await resolveCbmProject(ctx.cwd, extension.cbm).catch((error: unknown) => ({
+      const resolution = await ensureProjectForRepo(ctx.cwd, extension.cbm, {
+        allowIndex: true,
+        cache: state.projectCache
+      }).catch((error: unknown) => ({
         project: null,
+        indexedThisSession: false,
         reason: error instanceof Error ? error.message : String(error)
       }));
       ctx.ui.notify(
@@ -99,6 +117,9 @@ export default function sydesPiExtension(pi: ExtensionAPI): void {
           `cbm: ${cbmPath ?? "not found"}`,
           `CBM transport: ${extension.cbm.transportKind}`,
           `project: ${resolution.project?.name ?? "unresolved"}`,
+          `project indexed this session: ${resolution.indexedThisSession ? "yes" : "no"}`,
+          `exploration policy ready: ${state.lastContext?.entryPoints.length ? "yes" : "no"}`,
+          `impact injection boundary: ${state.impactInjectionBoundary}`,
           resolution.reason ? `reason: ${resolution.reason}` : undefined
         ]
           .filter(Boolean)
@@ -117,7 +138,10 @@ export default function sydesPiExtension(pi: ExtensionAPI): void {
         return;
       }
 
-      const context = await buildRelevantContext(task, ctx.cwd, extension.cbm);
+      const context = await buildRelevantContext(task, ctx.cwd, extension.cbm, {
+        allowIndex: true,
+        projectCache: state.projectCache
+      });
       if (!context) {
         state.lastContext = null;
         state.lastReason = "Sydes could not resolve graph context";
@@ -144,7 +168,10 @@ export default function sydesPiExtension(pi: ExtensionAPI): void {
   pi.registerCommand("sydes-impact", {
     description: "Build Sydes impact guidance for the current git diff without calling a model",
     handler: async (_args, ctx) => {
-      const affected = await buildAffectedContext(ctx.cwd, extension.cbm);
+      const affected = await buildAffectedContext(ctx.cwd, extension.cbm, undefined, {
+        allowIndex: true,
+        cache: state.projectCache
+      });
       if (!affected) {
         state.lastReason = "No current changes or Sydes impact context unavailable";
         ctx.ui.notify(state.lastReason, "warning");
@@ -171,9 +198,10 @@ export default function sydesPiExtension(pi: ExtensionAPI): void {
   pi.on("before_agent_start", createBeforeAgentStartHandler(extension.cbm, state));
   pi.on("tool_result", (event, ctx) => {
     observeMutationResult(event, ctx.cwd, state);
+    observeTestResult(event, state);
   });
-  pi.on("agent_settled", async (_event, ctx) => {
-    await maybeSendImpactGuidance(extension.cbm, state, ctx.cwd, pi);
+  (pi.on as (event: "context", handler: (event: ContextEvent, ctx: ExtensionContext) => Promise<{ messages?: unknown[] } | undefined>) => void)("context", async (event, ctx) => {
+    return maybeInjectImpactGuidanceIntoContext(extension.cbm, state, ctx.cwd, event);
   });
   pi.on("session_shutdown", async () => {
     state.telemetry?.recordCbm(extension.cbm.processStartCount, extension.cbm.transportKind);
@@ -191,7 +219,10 @@ export function createBeforeAgentStartHandler(cbm: CbmClient, state: SydesRuntim
       return undefined;
     }
 
-    const context = await buildRelevantContext(event.prompt, ctx.cwd, cbm);
+    const context = await buildRelevantContext(event.prompt, ctx.cwd, cbm, {
+      allowIndex: true,
+      projectCache: state.projectCache
+    });
     if (!context) {
       state.lastContext = null;
       state.lastReason = "Sydes graph guidance unavailable";
@@ -231,6 +262,8 @@ export function renderDebugContext(context: RelevantContext): string {
     `files: ${context.files.join(", ") || "none"}`,
     `tests: ${context.tests.join(", ") || "none"}`,
     `relationships: ${context.relationships.length}`,
+    `indexed this session: ${context.projectIndexedThisSession ? "yes" : "no"}`,
+    `project ensure ms: ${context.projectEnsureElapsedMs ?? "n/a"}`,
     `query count: ${context.querySummary.queryCount}`,
     `elapsed ms: ${context.querySummary.elapsedMs}`,
     "",
@@ -256,6 +289,22 @@ export function observeMutationResult(event: ToolResultEvent, repoPath: string, 
     timestamp: Date.now(),
     toolCallId: event.toolCallId
   });
+  state.testCommandsAfterLastMutation = [];
+}
+
+export function observeTestResult(event: ToolResultEvent, state: SydesRuntimeState): void {
+  if (event.isError || event.toolName !== "bash" || state.pendingMutations.length === 0) {
+    return;
+  }
+  const command = typeof event.input.command === "string" ? event.input.command : "";
+  if (!/\bgo\s+test\b/.test(command)) {
+    return;
+  }
+  state.testCommandsAfterLastMutation.push({
+    command,
+    timestamp: Date.now(),
+    toolCallId: event.toolCallId
+  });
 }
 
 export async function maybeSendImpactGuidance(
@@ -265,36 +314,129 @@ export async function maybeSendImpactGuidance(
   pi: Pick<ExtensionAPI, "sendMessage">,
   impactBuilder: (repoPath: string, cbmClient: CbmClient) => Promise<AffectedContext | null> = buildAffectedContext
 ): Promise<void> {
-  if (!state.impactDirty) {
+  const guidance = await buildPendingImpactGuidance(cbm, state, cwd, "agent_settled", impactBuilder);
+  if (!guidance || guidance.suppressed) {
     return;
+  }
+  pi.sendMessage(guidance.message, { deliverAs: "followUp", triggerTurn: true });
+}
+
+export async function maybeInjectImpactGuidanceIntoContext(
+  cbm: CbmClient,
+  state: SydesRuntimeState,
+  cwd: string,
+  event: ContextEvent,
+  impactBuilder: (repoPath: string, cbmClient: CbmClient) => Promise<AffectedContext | null> = (repoPath, cbmClient) =>
+    buildAffectedContext(repoPath, cbmClient, undefined, {
+      allowIndex: true,
+      cache: state.projectCache
+    })
+): Promise<{ messages?: unknown[] } | undefined> {
+  const guidance = await buildPendingImpactGuidance(cbm, state, cwd, "context", impactBuilder);
+  if (!guidance || guidance.suppressed) {
+    return undefined;
+  }
+  return {
+    messages: [
+      ...event.messages,
+      {
+        role: "custom",
+        customType: "sydes-impact-guidance",
+        content: guidance.message.content,
+        display: guidance.message.display,
+        details: guidance.message.details,
+        timestamp: Date.now()
+      } as never
+    ]
+  };
+}
+
+async function buildPendingImpactGuidance(
+  cbm: CbmClient,
+  state: SydesRuntimeState,
+  cwd: string,
+  injectionHook: string,
+  impactBuilder: (repoPath: string, cbmClient: CbmClient) => Promise<AffectedContext | null>
+): Promise<
+  | {
+      message: {
+        customType: string;
+        content: string;
+        display: true;
+        details: { context: AffectedContext };
+      };
+      suppressed: boolean;
+    }
+  | null
+> {
+  if (!state.impactDirty) {
+    return null;
   }
 
   const affected = await impactBuilder(cwd, cbm);
   state.impactDirty = false;
   state.pendingMutations = [];
+  const testsAfterMutation = state.testCommandsAfterLastMutation;
+  state.testCommandsAfterLastMutation = [];
   if (!affected) {
     state.lastReason = "Sydes impact guidance unavailable";
-    return;
+    return null;
   }
   if (affected.signature === state.lastImpactSignature) {
     state.lastAffectedContext = affected;
-    return;
+    return null;
   }
 
   state.lastAffectedContext = affected;
   state.lastImpactSignature = affected.signature;
   state.lastReason = null;
   const guidance = buildImpactGuidance(affected);
-  state.telemetry?.recordImpact(affected, guidance);
-  pi.sendMessage(
-    {
+  if (hasRelevantTestAfterLastMutation(affected, testsAfterMutation)) {
+    state.telemetry?.recordImpactSuppressed(affected, guidance, injectionHook);
+    return {
+      message: {
+        customType: "sydes-impact-guidance",
+        content: guidance,
+        display: true,
+        details: { context: affected }
+      },
+      suppressed: true
+    };
+  }
+
+  state.telemetry?.recordImpact(affected, guidance, {
+    injectionHook,
+    injectedBeforeNextModelTurn: injectionHook === "context"
+  });
+  return {
+    message: {
       customType: "sydes-impact-guidance",
       content: guidance,
       display: true,
       details: { context: affected }
     },
-    { deliverAs: "followUp", triggerTurn: true }
-  );
+    suppressed: false
+  };
+}
+
+function hasRelevantTestAfterLastMutation(context: AffectedContext, tests: ObservedTestCommand[]): boolean {
+  if (tests.length === 0) {
+    return false;
+  }
+  if (context.tests.length === 0) {
+    return false;
+  }
+  return tests.some((test) => {
+    if (/\bgo\s+test\s+\.\/\.\.\./.test(test.command)) {
+      return true;
+    }
+    return context.tests.some((target) => test.command.includes(packagePathForTest(target)));
+  });
+}
+
+function packagePathForTest(path: string): string {
+  const index = path.lastIndexOf("/");
+  return index >= 0 ? `./${path.slice(0, index)}` : ".";
 }
 
 export function renderImpactDebugContext(context: AffectedContext): string {
@@ -305,6 +447,8 @@ export function renderImpactDebugContext(context: AffectedContext): string {
     `impacted: ${context.impactedSymbols.map((symbol) => `${symbol.filePath ?? "?"}:${symbol.name}`).join(", ") || "none"}`,
     `routes: ${context.routes.map((route) => `${route.method ?? ""} ${route.path}`.trim()).join(", ") || "none"}`,
     `tests: ${context.tests.join(", ") || "none"}`,
+    `indexed this session: ${context.projectIndexedThisSession ? "yes" : "no"}`,
+    `project ensure ms: ${context.projectEnsureElapsedMs ?? "n/a"}`,
     `query count: ${context.querySummary.queryCount}`,
     `detect_changes ms: ${context.querySummary.detectChangesElapsedMs ?? "n/a"}`,
     `elapsed ms: ${context.querySummary.elapsedMs}`,

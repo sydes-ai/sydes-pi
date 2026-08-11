@@ -1,9 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import { createBeforeAgentStartHandler, shouldInjectForPrompt } from "../src/extension.js";
 import {
   buildExplorationGuidance,
   buildRelevantContext,
   boundContext,
+  canonicalRepoRoot,
+  ensureProjectForRepo,
   extractHttpRoutes,
   extractTaskIdentifiers,
   normalizeRepoPath,
@@ -12,6 +19,7 @@ import {
 } from "../src/policy/exploration.js";
 import type { PolicyCbmClient, RelevantContext, RelevantSymbol } from "../src/policy/types.js";
 
+const execFileAsync = promisify(execFile);
 const repoPath = "/tmp/pokemon-api";
 const projectName = "Users-test-pokemon-api";
 
@@ -78,8 +86,70 @@ describe("Phase 1 exploration policy", () => {
 
   it("resolves projects by canonical root path", async () => {
     await expect(resolveCbmProject(repoPath, makeClient())).resolves.toEqual({
-      project: { name: projectName, root_path: repoPath }
+      project: { name: projectName, root_path: repoPath },
+      repoRoot: repoPath
     });
+  });
+
+  it("reuses an exact indexed repo without indexing", async () => {
+    const client = makeClient({ indexRepository: vi.fn() });
+    const resolution = await ensureProjectForRepo(repoPath, client, { allowIndex: true });
+    expect(resolution.project?.name).toBe(projectName);
+    expect(resolution.indexedThisSession).toBe(false);
+    expect(client.indexRepository).not.toHaveBeenCalled();
+  });
+
+  it("indexes an unseen worktree once and caches it", async () => {
+    const unseen = "/tmp/pokemon-api-worktree";
+    const client = makeClient({
+      listProjects: vi
+        .fn()
+        .mockResolvedValueOnce(envelope({ projects: [{ name: projectName, root_path: repoPath }] }))
+        .mockResolvedValue(envelope({ projects: [{ name: "worktree-project", root_path: unseen }] })),
+      indexRepository: vi.fn(async () => envelope({ project: "worktree-project" }))
+    });
+    const cache = new Map();
+    const first = await ensureProjectForRepo(unseen, client, { allowIndex: true, cache });
+    const second = await ensureProjectForRepo(unseen, client, { allowIndex: true, cache });
+    expect(first.project?.name).toBe("worktree-project");
+    expect(first.indexedThisSession).toBe(true);
+    expect(second.project?.name).toBe("worktree-project");
+    expect(client.indexRepository).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not choose an ambiguous basename project for a different worktree", async () => {
+    const client = makeClient({
+      listProjects: vi.fn(async () =>
+        envelope({
+          projects: [
+            { name: "sample", root_path: "/Users/me/sample_repos/pokemon-api" },
+            { name: "other", root_path: "/Users/me/other/pokemon-api" }
+          ]
+        })
+      )
+    });
+    const resolution = await resolveCbmProject("/tmp/pokemon-api", client);
+    expect(resolution.project).toBeNull();
+    expect(resolution.reason).toContain("no exact CBM project");
+  });
+
+  it("resolves git worktree .git file layouts through git rev-parse", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sydes-policy-"));
+    try {
+      const repo = join(root, "repo");
+      const worktree = join(root, "worktree");
+      await execFileAsync("git", ["init", repo]);
+      await execFileAsync("git", ["config", "user.email", "sydes@example.com"], { cwd: repo });
+      await execFileAsync("git", ["config", "user.name", "Sydes"], { cwd: repo });
+      await writeFile(join(repo, "file.txt"), "one\n");
+      await execFileAsync("git", ["add", "file.txt"], { cwd: repo });
+      await execFileAsync("git", ["commit", "-m", "init"], { cwd: repo });
+      await execFileAsync("git", ["worktree", "add", worktree], { cwd: repo });
+      await mkdir(join(worktree, "subdir"));
+      await expect(canonicalRepoRoot(join(worktree, "subdir"), undefined)).resolves.toBe(await realpath(worktree));
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it("normalizes repo-local POSIX paths and rejects outside paths", () => {
@@ -124,7 +194,9 @@ describe("Phase 1 exploration policy", () => {
   it("renders concise guidance with source verification wording", () => {
     const guidance = buildExplorationGuidance(fakeContext());
     expect(guidance).toContain("[Sydes graph guidance]");
-    expect(guidance).toContain("verify against source");
+    expect(guidance).toContain("Start exploration with:");
+    expect(guidance).toContain("before broad repository search");
+    expect(guidance).toContain("Verify all graph claims against source");
     expect(guidance.length).toBeLessThanOrEqual(1500);
   });
 
@@ -139,6 +211,23 @@ describe("Phase 1 exploration policy", () => {
     expect(context?.project).toBe(projectName);
     expect(context?.entryPoints[0].filePath).toBe("pkg/handler/pokedex.go");
     expect(context?.querySummary.queryCount).toBeGreaterThanOrEqual(3);
+  });
+
+  it("returns non-empty worktree context from fake CBM results after indexing", async () => {
+    const worktree = "/tmp/live/pokemon-api";
+    const client = makeClient({
+      listProjects: vi
+        .fn()
+        .mockResolvedValueOnce(envelope({ projects: [] }))
+        .mockResolvedValue(envelope({ projects: [{ name: projectName, root_path: worktree }] })),
+      indexRepository: vi.fn(async () => envelope({ project: projectName }))
+    });
+    const context = await buildRelevantContext("POST /api/v1/pokemon hp AddPokemon tests", worktree, client, {
+      allowIndex: true
+    });
+    expect(context?.entryPoints.length).toBeGreaterThan(0);
+    expect(context?.files.length).toBeGreaterThan(0);
+    expect(context?.projectIndexedThisSession).toBe(true);
   });
 
   it("does not call list_projects redundantly within one context build", async () => {
@@ -203,6 +292,9 @@ function makeState() {
     lastReason: null,
     impactDirty: false,
     pendingMutations: [],
+    testCommandsAfterLastMutation: [],
+    projectCache: new Map(),
+    impactInjectionBoundary: "context" as const,
     lastImpactSignature: null
   };
 }

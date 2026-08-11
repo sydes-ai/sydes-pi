@@ -62,6 +62,8 @@ export async function analyzeSession(input: AnalyzerInput): Promise<Record<strin
   ]);
   const first5 = reads.slice(0, 5);
   const first10 = reads.slice(0, 10);
+  const first3 = reads.slice(0, 3);
+  const first3Hits = first3.filter((path) => priority.has(path));
   const first5Hits = first5.filter((path) => priority.has(path));
   const first10Hits = first10.filter((path) => priority.has(path));
   const agentTestRuns = calls.filter((call) => call.name === "bash" && /go\s+test/.test(String((call.args as any)?.command ?? "")));
@@ -99,8 +101,11 @@ export async function analyzeSession(input: AnalyzerInput): Promise<Record<strin
       fileReads: reads.length,
       uniqueReads: new Set(reads).size,
       repeatedReads: reads.length - new Set(reads).size,
+      first3Reads: first3,
       first10Reads: first10,
       readsBeforeFirstEdit: firstEdit ? calls.filter((call) => readPathsForCall(call, input.repoRoot).length > 0 && call.turn <= firstEdit.turn).length : reads.length,
+      first3PriorityHits: first3Hits,
+      first3PriorityHitRate: first3.length ? first3Hits.length / first3.length : null,
       first5PriorityHits: first5Hits,
       first5PriorityHitRate: first5.length ? first5Hits.length / first5.length : null,
       first10PriorityHits: first10Hits,
@@ -126,7 +131,12 @@ export async function analyzeSession(input: AnalyzerInput): Promise<Record<strin
       impactGuidanceCount: sydes.impactGuidanceCount ?? 0,
       impactFollowupTurns: Math.max(0, (sydes.impactGuidanceCount ?? 0) > 0 ? turns - (lastSuccessfulEditTurn(calls, results) ?? turns) : 0),
       cbmProcessStartCount: sydes.cbmProcessStartCount ?? null,
-      cbmFallbackUsed: !!sydes.cbmFallbackUsed
+      cbmFallbackUsed: !!sydes.cbmFallbackUsed,
+      projectIndexedThisSession: !!sydes.explorationContext?.projectIndexedThisSession,
+      projectEnsureElapsedMs: sydes.explorationContext?.projectEnsureElapsedMs ?? null,
+      impactInjectionHook: sydes.impactGuidanceEvents?.at?.(-1)?.injectionHook ?? null,
+      impactGuidanceSuppressedAsAlreadyVerified: !!sydes.impactGuidanceEvents?.some?.((event: any) => event.suppressedAsAlreadyVerified),
+      impactGuidanceInjectedBeforeNextModelTurn: !!sydes.impactGuidanceEvents?.some?.((event: any) => event.injectedBeforeNextModelTurn)
     }
   };
   await writeFile(input.outputPath, `${JSON.stringify(summary, null, 2)}\n`);

@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { maybeSendImpactGuidance, observeMutationResult } from "../src/extension.js";
+import {
+  maybeInjectImpactGuidanceIntoContext,
+  maybeSendImpactGuidance,
+  observeMutationResult,
+  observeTestResult
+} from "../src/extension.js";
 import {
   buildAffectedContext,
   buildImpactGuidance,
@@ -68,6 +73,9 @@ function makeState(): SydesRuntimeState {
     lastReason: null,
     impactDirty: false,
     pendingMutations: [],
+    testCommandsAfterLastMutation: [],
+    projectCache: new Map(),
+    impactInjectionBoundary: "context",
     lastImpactSignature: null
   };
 }
@@ -117,6 +125,83 @@ describe("Phase 2 impact policy", () => {
     expect(builder).toHaveBeenCalledTimes(1);
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(state.impactDirty).toBe(false);
+  });
+
+  it("context hook injects impact before the next model reasoning boundary", async () => {
+    const state = makeState();
+    state.impactDirty = true;
+    state.pendingMutations = [{ filePath: "pkg/handler/pokedex.go", toolName: "edit", timestamp: 1, toolCallId: "1" }];
+    const result = await maybeInjectImpactGuidanceIntoContext(
+      {} as never,
+      state,
+      repoPath,
+      { type: "context", messages: [{ role: "user", content: "fix", timestamp: 1 }] } as never,
+      vi.fn(async () => fakeAffectedContext("context"))
+    );
+    expect(result?.messages?.at(-1)).toMatchObject({
+      role: "custom",
+      customType: "sydes-impact-guidance"
+    });
+    expect(state.impactDirty).toBe(false);
+  });
+
+  it("natural context injection does not call sendMessage or triggerTurn", async () => {
+    const state = makeState();
+    state.impactDirty = true;
+    state.pendingMutations = [{ filePath: "pkg/handler/pokedex.go", toolName: "edit", timestamp: 1, toolCallId: "1" }];
+    const sendMessage = vi.fn();
+    await maybeInjectImpactGuidanceIntoContext(
+      {} as never,
+      state,
+      repoPath,
+      { type: "context", messages: [] } as never,
+      vi.fn(async () => fakeAffectedContext("natural"))
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("identical impact signature does not resend through context", async () => {
+    const state = makeState();
+    const context = fakeAffectedContext("same-context");
+    state.impactDirty = true;
+    state.pendingMutations = [{ filePath: "a.go", toolName: "edit", timestamp: 1, toolCallId: "1" }];
+    const first = await maybeInjectImpactGuidanceIntoContext({} as never, state, repoPath, { type: "context", messages: [] } as never, vi.fn(async () => context));
+    state.impactDirty = true;
+    state.pendingMutations = [{ filePath: "a.go", toolName: "edit", timestamp: 2, toolCallId: "2" }];
+    const second = await maybeInjectImpactGuidanceIntoContext({} as never, state, repoPath, { type: "context", messages: [] } as never, vi.fn(async () => context));
+    expect(first?.messages).toHaveLength(1);
+    expect(second).toBeUndefined();
+  });
+
+  it("guidance custom messages do not recursively trigger impact", () => {
+    const state = makeState();
+    observeMutationResult(
+      { type: "tool_result", toolName: "sydes-impact-guidance", toolCallId: "custom", input: {}, content: [], isError: false, details: undefined } as never,
+      repoPath,
+      state
+    );
+    expect(state.impactDirty).toBe(false);
+  });
+
+  it("already-tested-after-last-edit suppresses redundant impact guidance", async () => {
+    const state = makeState();
+    observeMutationResult(
+      { type: "tool_result", toolName: "edit", toolCallId: "edit-1", input: { path: "pkg/handler/pokedex.go" }, content: [], isError: false, details: undefined } as never,
+      repoPath,
+      state
+    );
+    observeTestResult(
+      { type: "tool_result", toolName: "bash", toolCallId: "test-1", input: { command: "go test ./..." }, content: [], isError: false, details: undefined } as never,
+      state
+    );
+    const result = await maybeInjectImpactGuidanceIntoContext(
+      {} as never,
+      state,
+      repoPath,
+      { type: "context", messages: [] } as never,
+      vi.fn(async () => fakeAffectedContext("tested"))
+    );
+    expect(result).toBeUndefined();
   });
 
   it("empty git diff returns no context", async () => {

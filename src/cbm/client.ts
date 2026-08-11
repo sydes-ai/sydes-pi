@@ -36,7 +36,8 @@ export class CbmClient {
     this.listProjectsCache = null;
     return this.run("index_repository", {
       "repo-path": repoPath,
-      name
+      name,
+      mode: "fast"
     });
   }
 

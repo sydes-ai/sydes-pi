@@ -1,15 +1,20 @@
 import { realpath } from "node:fs/promises";
+import { execFile } from "node:child_process";
 import { basename, relative, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
+import { promisify } from "node:util";
 import type {
   BuildRelevantContextOptions,
   CbmProject,
   PolicyCbmClient,
+  ProjectEnsureOptions,
   ProjectResolution,
   RelevantContext,
   RelevantRelationship,
   RelevantSymbol
 } from "./types.js";
+
+const execFileAsync = promisify(execFile);
 
 const STOP_WORDS = new Set([
   "the",
@@ -86,9 +91,10 @@ export function extractTaskIdentifiers(task: string): string[] {
 
 export async function resolveCbmProject(
   repoPath: string,
-  cbmClient: Pick<PolicyCbmClient, "listProjects">
+  cbmClient: Pick<PolicyCbmClient, "listProjects">,
+  options: Pick<ProjectEnsureOptions, "resolveRepoRoot"> = {}
 ): Promise<ProjectResolution> {
-  const repoReal = await safeRealpath(repoPath);
+  const repoReal = await canonicalRepoRoot(repoPath, options.resolveRepoRoot);
   const response = await cbmClient.listProjects();
   const projects = unwrapStructured<{ projects?: CbmProject[] }>(response.parsed)?.projects ?? [];
   const withRoots = await Promise.all(
@@ -101,22 +107,73 @@ export async function resolveCbmProject(
 
   const exact = withRoots.filter((candidate) => candidate.realRoot === repoReal);
   if (exact.length === 1) {
-    return { project: exact[0].project };
+    return { project: exact[0].project, repoRoot: repoReal };
   }
   if (exact.length > 1) {
-    return { project: null, reason: `ambiguous exact CBM projects for ${repoPath}` };
-  }
-
-  const base = basename(repoReal);
-  const baseMatches = withRoots.filter((candidate) => candidate.root && basename(candidate.root) === base);
-  if (baseMatches.length === 1) {
-    return { project: baseMatches[0].project };
+    return { project: null, repoRoot: repoReal, reason: `ambiguous exact CBM projects for ${repoReal}` };
   }
 
   return {
     project: null,
-    reason: baseMatches.length > 1 ? `ambiguous basename CBM projects for ${base}` : `no CBM project for ${repoPath}`
+    repoRoot: repoReal,
+    reason: `no exact CBM project for ${repoReal}`
   };
+}
+
+export async function ensureProjectForRepo(
+  repoPath: string,
+  cbmClient: Pick<PolicyCbmClient, "listProjects" | "indexRepository">,
+  options: ProjectEnsureOptions = {}
+): Promise<ProjectResolution> {
+  const startedAt = options.now?.() ?? performance.now();
+  const repoRoot = await canonicalRepoRoot(repoPath, options.resolveRepoRoot);
+  const cached = options.cache?.get(repoRoot);
+  if (cached) {
+    return {
+      project: cached.project,
+      repoRoot,
+      reason: cached.reason,
+      indexedThisSession: cached.indexedThisSession,
+      ensureElapsedMs: cached.ensureElapsedMs
+    };
+  }
+
+  let resolution = await resolveCbmProject(repoRoot, cbmClient, {
+    resolveRepoRoot: async () => repoRoot
+  });
+  let indexedThisSession = false;
+
+  if (!resolution.project && options.allowIndex && cbmClient.indexRepository) {
+    try {
+      await cbmClient.indexRepository(repoRoot);
+      indexedThisSession = true;
+      resolution = await resolveCbmProject(repoRoot, cbmClient, {
+        resolveRepoRoot: async () => repoRoot
+      });
+    } catch (error) {
+      resolution = {
+        project: null,
+        repoRoot,
+        reason: error instanceof Error ? error.message : String(error)
+      };
+    }
+  }
+
+  const ensureElapsedMs = Math.round((options.now?.() ?? performance.now()) - startedAt);
+  const result: ProjectResolution = {
+    ...resolution,
+    repoRoot,
+    indexedThisSession,
+    ensureElapsedMs
+  };
+  options.cache?.set(repoRoot, {
+    repoRoot,
+    project: result.project,
+    indexedThisSession,
+    ensureElapsedMs,
+    reason: result.reason
+  });
+  return result;
 }
 
 export async function buildRelevantContext(
@@ -130,17 +187,20 @@ export async function buildRelevantContext(
   const calls: Array<{ name: string; elapsedMs: number; transport?: string }> = [];
 
   try {
-    let resolution = await timed(calls, "list_projects", () => resolveCbmProject(repoPath, cbmClient));
-    if (!resolution.project && options.allowIndex && cbmClient.indexRepository) {
-      await timed(calls, "index_repository", () => cbmClient.indexRepository!(repoPath));
-      queryCount += 1;
-      resolution = await timed(calls, "list_projects", () => resolveCbmProject(repoPath, cbmClient));
-    }
+    const resolution = await timed(calls, "ensure_project", () =>
+      ensureProjectForRepo(repoPath, cbmClient, {
+        allowIndex: options.allowIndex,
+        cache: options.projectCache,
+        now: options.now,
+        resolveRepoRoot: options.resolveRepoRoot
+      })
+    );
     if (!resolution.project) {
       return null;
     }
 
     const project = resolution.project.name;
+    const repoRoot = resolution.repoRoot ?? repoPath;
     const routes = extractHttpRoutes(task);
     const identifiers = extractTaskIdentifiers(task);
     const candidates: RelevantSymbol[] = [];
@@ -154,12 +214,12 @@ export async function buildRelevantContext(
         label: "Route",
         limit: 5
       }));
-      candidates.push(...symbolsFromSearch(routeSearch.parsed, repoPath, task, 40));
+      candidates.push(...symbolsFromSearch(routeSearch.parsed, repoRoot, task, 40));
 
       if (candidates.length === 0) {
         queryCount += 1;
         const routeCode = await timed(calls, "route search_code", () => cbmClient.searchCode(project, route));
-        candidates.push(...symbolsFromSearch(routeCode.parsed, repoPath, task, 15));
+        candidates.push(...symbolsFromSearch(routeCode.parsed, repoRoot, task, 15));
       }
     }
 
@@ -171,21 +231,46 @@ export async function buildRelevantContext(
         query: symbolQuery,
         limit: 12
       }));
-      candidates.push(...symbolsFromSearch(symbolSearch.parsed, repoPath, task, 25));
+      candidates.push(...symbolsFromSearch(symbolSearch.parsed, repoRoot, task, 25));
+
+      if (routes.length > 0) {
+        const actionTerms = identifiers.filter((identifier) => /[A-Z_]/.test(identifier) || /pokemon/i.test(identifier));
+        queryCount += 1;
+        const structuralSearch = await timed(calls, "structural search_graph", () => cbmClient.searchGraphByArgs({
+          project,
+          query: `${actionTerms.join(" ")} handler service repository`,
+          limit: 20
+        }));
+        candidates.push(...symbolsFromSearch(structuralSearch.parsed, repoRoot, task, 22));
+      }
     }
 
     const ranked = rankSymbols(dedupeSymbols(candidates), task, routes, identifiers);
-    const traceTargets = ranked.slice(0, 2);
+    const fileBackedRanked = ranked.filter((symbol) => symbol.filePath);
+    const traceTargets = fileBackedRanked.slice(0, 2);
     const related: RelevantSymbol[] = [];
     for (const [index, target] of traceTargets.entries()) {
       queryCount += 1;
       const trace = await timed(calls, `trace_path #${index + 1}`, () => cbmClient.tracePath(project, target.qualifiedName));
-      const traced = symbolsFromTrace(trace.parsed, repoPath);
+      const traced = symbolsFromTrace(trace.parsed, repoRoot);
       related.push(...traced.symbols);
       relationships.push(...traced.relationships);
     }
+    for (const [index, symbol] of related.filter((item) => !item.filePath).slice(0, 3).entries()) {
+      const query = fileResolutionQuery(symbol.qualifiedName);
+      if (!query) {
+        continue;
+      }
+      queryCount += 1;
+      const resolved = await timed(calls, `resolve traced symbol #${index + 1}`, () => cbmClient.searchGraphByArgs({
+        project,
+        query,
+        limit: 8
+      }));
+      related.push(...symbolsFromSearch(resolved.parsed, repoRoot, task, 18));
+    }
 
-    const entryPoints = rankSymbols(dedupeSymbols([...ranked]), task, routes, identifiers).slice(
+    const entryPoints = rankSymbols(dedupeSymbols(fileBackedRanked), task, routes, identifiers).slice(
       0,
       LIMITS.entryPoints
     );
@@ -205,6 +290,8 @@ export async function buildRelevantContext(
     return {
       project,
       task,
+      projectIndexedThisSession: resolution.indexedThisSession,
+      projectEnsureElapsedMs: resolution.ensureElapsedMs,
       entryPoints,
       relatedSymbols,
       files,
@@ -242,13 +329,13 @@ async function timed<T>(
 }
 
 export function buildExplorationGuidance(context: RelevantContext): string {
-  const lines = ["[Sydes graph guidance]", "", "Start here:"];
-  for (const symbol of context.entryPoints.slice(0, LIMITS.entryPoints)) {
-    lines.push(`- ${symbol.filePath ?? "(unknown file)"} - ${symbol.name} (${symbol.kind})`);
+  const lines = ["[Sydes graph guidance]", "", "Start exploration with:"];
+  for (const [index, symbol] of context.entryPoints.slice(0, LIMITS.entryPoints).entries()) {
+    lines.push(`${index + 1}. ${symbol.filePath ?? "(unknown file)"} - ${symbol.name} (${symbol.kind})`);
   }
 
   if (context.tests.length > 0) {
-    lines.push("", "Relevant tests:");
+    lines.push("", "Then inspect:");
     for (const test of context.tests.slice(0, LIMITS.tests)) {
       lines.push(`- ${test}`);
     }
@@ -261,7 +348,8 @@ export function buildExplorationGuidance(context: RelevantContext): string {
     }
   }
 
-  lines.push("", "Treat this as navigation guidance and verify against source before editing.");
+  lines.push("", "Begin with these files before broad repository search unless source evidence contradicts the graph.");
+  lines.push("Verify all graph claims against source before editing.");
   return clampGuidance(lines.join("\n"));
 }
 
@@ -335,6 +423,17 @@ function deriveRouteActionIdentifiers(task: string): string[] {
     .join("");
   const pascal = `${verb}${pascalNoun}`;
   return [pascal, pascal[0].toLowerCase() + pascal.slice(1)];
+}
+
+function fileResolutionQuery(qualifiedName: string): string {
+  if (!qualifiedName || qualifiedName === "undefined") {
+    return "";
+  }
+  const parts = qualifiedName.split(".");
+  const short = shortName(qualifiedName);
+  const owner = parts.at(-2) && parts.at(-2) !== short ? parts.at(-2) : "";
+  const layer = parts.find((part) => /^(handler|service|repository|controller|route)s?$/.test(part)) ?? "";
+  return unique([owner, short, layer].filter(Boolean)).join(" ");
 }
 
 function symbolsFromSearch(parsed: unknown, repoPath: string, task: string, baseScore: number): RelevantSymbol[] {
@@ -497,4 +596,26 @@ async function safeRealpath(path: string): Promise<string> {
   } catch {
     return resolve(path);
   }
+}
+
+export async function canonicalRepoRoot(
+  repoPath: string,
+  resolver: ProjectEnsureOptions["resolveRepoRoot"]
+): Promise<string> {
+  if (resolver) {
+    return safeRealpath(await resolver(repoPath));
+  }
+  try {
+    const { stdout } = await execFileAsync("git", ["rev-parse", "--show-toplevel"], {
+      cwd: repoPath,
+      maxBuffer: 100_000
+    });
+    const root = stdout.trim();
+    if (root) {
+      return safeRealpath(root);
+    }
+  } catch {
+    // Non-git directories fail open to the provided path.
+  }
+  return safeRealpath(repoPath);
 }

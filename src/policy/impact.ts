@@ -10,9 +10,10 @@ import type {
   AffectedSymbol,
   GitDiffProvider,
   GitDiffResult,
+  ProjectEnsureOptions,
   PolicyCbmClient
 } from "./types.js";
-import { resolveCbmProject } from "./exploration.js";
+import { ensureProjectForRepo } from "./exploration.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -71,7 +72,8 @@ export const gitDiffProvider: GitDiffProvider = {
 export async function buildAffectedContext(
   repoPath: string,
   cbmClient: PolicyCbmClient,
-  diffProvider: GitDiffProvider = gitDiffProvider
+  diffProvider: GitDiffProvider = gitDiffProvider,
+  ensureOptions: ProjectEnsureOptions = {}
 ): Promise<AffectedContext | null> {
   const startedAt = performance.now();
   try {
@@ -80,10 +82,11 @@ export async function buildAffectedContext(
       return null;
     }
 
-    const resolution = await resolveCbmProject(repoPath, cbmClient);
+    const resolution = await ensureProjectForRepo(repoPath, cbmClient, ensureOptions);
     if (!resolution.project) {
       return null;
     }
+    const repoRoot = resolution.repoRoot ?? repoPath;
 
     const detect = await cbmClient.detectChanges(resolution.project.name);
     const parsed = unwrapStructured<DetectChangesResult>(detect.parsed);
@@ -92,7 +95,7 @@ export async function buildAffectedContext(
     }
 
     const changedFiles = unique(
-      (parsed.changed_files ?? diff.changedFiles).map((path) => normalizeRepoPath(repoPath, path)).filter(isString)
+      (parsed.changed_files ?? diff.changedFiles).map((path) => normalizeRepoPath(repoRoot, path)).filter(isString)
     );
     const impacted = parsed.impacted ?? [];
     const routes = impacted
@@ -101,7 +104,7 @@ export async function buildAffectedContext(
       .slice(0, LIMITS.routes);
     const impactedSymbols = impacted
       .filter((item) => item.label !== "Route" && !item.qn?.startsWith("__route__"))
-      .map((item) => symbolFromImpact(repoPath, item))
+      .map((item) => symbolFromImpact(repoRoot, item))
       .filter((symbol): symbol is AffectedSymbol => !!symbol)
       .sort(rankAffectedSymbol)
       .slice(0, LIMITS.impactedSymbols);
@@ -114,6 +117,8 @@ export async function buildAffectedContext(
 
     const context: AffectedContext = {
       project: resolution.project.name,
+      projectIndexedThisSession: resolution.indexedThisSession,
+      projectEnsureElapsedMs: resolution.ensureElapsedMs,
       changedFiles: changedFiles.slice(0, 20),
       changedSymbols: changedSymbols.slice(0, LIMITS.changedSymbols),
       impactedSymbols,

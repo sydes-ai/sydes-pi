@@ -65,8 +65,8 @@ function verifyRegistrations(): { commands: string[]; hooks: string[] } {
   if (!hooks.includes("tool_result")) {
     throw new Error("tool_result was not registered");
   }
-  if (!hooks.includes("agent_settled")) {
-    throw new Error("agent_settled was not registered");
+  if (!hooks.includes("context")) {
+    throw new Error("context was not registered");
   }
 
   return { commands, hooks };

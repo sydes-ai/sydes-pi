@@ -52,8 +52,7 @@ export async function analyzeSession(input: AnalyzerInput): Promise<Record<strin
   const failed = results.filter((result) => result.isError === true).length;
   const unresolved = calls.filter((call) => !resultIds.has(call.id)).length;
   const reads = calls
-    .filter((call) => call.name === "read")
-    .map((call) => normalizePath(input.repoRoot, getArgPath(call.args)))
+    .flatMap((call) => readPathsForCall(call, input.repoRoot))
     .filter((path): path is string => !!path);
   const firstEdit = firstSuccessfulEdit(calls, results, input.repoRoot);
   const priority = new Set<string>([
@@ -75,11 +74,11 @@ export async function analyzeSession(input: AnalyzerInput): Promise<Record<strin
     correctness: {
       repoTests: repoTestsText.includes("REPO_TESTS=PASS") ? "PASS" : "FAIL",
       hiddenOracle: oracleText,
-      taskCorrectness: oracleText.includes("TASK_CORRECTNESS=PASS") && repoTestsText.includes("REPO_TESTS=PASS") ? "PASS" : "FAIL"
+      taskCorrectness: /TASK_CORRECTNESS[:=]\s*PASS/.test(oracleText) && /REPO_TESTS[:=]\s*PASS/.test(repoTestsText) ? "PASS" : "FAIL"
     },
     contamination: {
       provider429Count,
-      rateLimitContaminated: provider429Count > 0 || /rate limit|429/i.test(sessionText)
+      rateLimitContaminated: provider429Count > 0
     },
     usage,
     agent: {
@@ -101,7 +100,7 @@ export async function analyzeSession(input: AnalyzerInput): Promise<Record<strin
       uniqueReads: new Set(reads).size,
       repeatedReads: reads.length - new Set(reads).size,
       first10Reads: first10,
-      readsBeforeFirstEdit: firstEdit ? calls.filter((call) => call.name === "read" && call.turn <= firstEdit.turn).length : reads.length,
+      readsBeforeFirstEdit: firstEdit ? calls.filter((call) => readPathsForCall(call, input.repoRoot).length > 0 && call.turn <= firstEdit.turn).length : reads.length,
       first5PriorityHits: first5Hits,
       first5PriorityHitRate: first5.length ? first5Hits.length / first5.length : null,
       first10PriorityHits: first10Hits,
@@ -144,8 +143,8 @@ function collectToolCalls(entries: unknown[]): ToolCall[] {
     for (const object of walkObjects(entry)) {
       const id = stringValue(object.toolCallId ?? object.tool_call_id ?? object.id);
       const name = stringValue(object.toolName ?? object.name);
-      if (id && name && (object.args || object.input || object.parameters)) {
-        calls.push({ id, name, args: object.args ?? object.input ?? object.parameters, turn });
+      if (id && name && (object.args || object.input || object.parameters || object.arguments)) {
+        calls.push({ id, name, args: object.args ?? object.input ?? object.parameters ?? object.arguments, turn });
       }
     }
   });
@@ -177,22 +176,30 @@ function* walkObjects(value: unknown): Generator<any> {
 
 function aggregateUsage(entries: unknown[]): Record<string, number | null> {
   const totals: Record<string, number> = {};
+  let apiCalls = 0;
   for (const object of walkObjects(entries)) {
     if (object.usage && typeof object.usage === "object") {
+      apiCalls += 1;
       for (const [key, value] of Object.entries(object.usage)) {
         if (typeof value === "number") totals[key] = (totals[key] ?? 0) + value;
+      }
+      const cost = (object.usage as any).cost;
+      if (cost && typeof cost === "object") {
+        for (const [key, value] of Object.entries(cost)) {
+          if (typeof value === "number") totals[`cost.${key}`] = (totals[`cost.${key}`] ?? 0) + value;
+        }
       }
     }
   }
   return {
-    apiCalls: Object.keys(totals).length ? Object.values(totals).length : null,
-    inputTokens: totals.inputTokens ?? totals.promptTokens ?? null,
-    cachedTokens: totals.cacheReadTokens ?? totals.cachedTokens ?? null,
-    cacheWriteTokens: totals.cacheWriteTokens ?? null,
-    outputTokens: totals.outputTokens ?? totals.completionTokens ?? null,
+    apiCalls: apiCalls || null,
+    inputTokens: totals.inputTokens ?? totals.promptTokens ?? totals.input ?? null,
+    cachedTokens: totals.cacheReadTokens ?? totals.cachedTokens ?? totals.cacheRead ?? null,
+    cacheWriteTokens: totals.cacheWriteTokens ?? totals.cacheWrite ?? null,
+    outputTokens: totals.outputTokens ?? totals.completionTokens ?? totals.output ?? null,
     reasoningTokens: totals.reasoningTokens ?? null,
     totalTokens: totals.totalTokens ?? null,
-    totalCost: totals.totalCost ?? null
+    totalCost: totals.totalCost ?? totals["cost.total"] ?? null
   };
 }
 
@@ -220,9 +227,7 @@ function testsAfterLastEdit(testRuns: ToolCall[], calls: ToolCall[], results: To
 
 function firstPriorityReadTurn(calls: ToolCall[], repoRoot: string, priority: Set<string>): number | null {
   for (const call of calls) {
-    if (call.name !== "read") continue;
-    const path = normalizePath(repoRoot, getArgPath(call.args));
-    if (path && priority.has(path)) return call.turn;
+    if (readPathsForCall(call, repoRoot).some((path) => priority.has(path))) return call.turn;
   }
   return null;
 }
@@ -238,6 +243,21 @@ function normalizePath(repoRoot: string, path: string | undefined): string | und
   return rel && !rel.startsWith("..") ? rel : path.split(/[\\/]+/).slice(-2).join("/");
 }
 
+function readPathsForCall(call: ToolCall, repoRoot: string): string[] {
+  if (call.name === "read") {
+    const path = normalizePath(repoRoot, getArgPath(call.args));
+    return path ? [path] : [];
+  }
+  if (call.name !== "bash") return [];
+  const command = String((call.args as any)?.command ?? "");
+  const paths = new Set<string>();
+  for (const match of command.matchAll(/\b(?:sed|nl|cat)\b(?:\s+-[^\s]+)*\s+(?:'[^']*'\s+|"[^"]*"\s+)?([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)/g)) {
+    const path = normalizePath(repoRoot, match[1]);
+    if (path) paths.add(path);
+  }
+  return [...paths];
+}
+
 function summarizeDiff(diffText: string): { files: string[]; insertions: number; deletions: number } {
   const files = [...diffText.matchAll(/^diff --git a\/(.+?) b\/(.+)$/gm)].map((match) => match[2]);
   const insertions = diffText.split("\n").filter((line) => line.startsWith("+") && !line.startsWith("+++")).length;
@@ -246,7 +266,8 @@ function summarizeDiff(diffText: string): { files: string[]; insertions: number;
 }
 
 function countRateLimitEvidence(text: string): number {
-  return (text.match(/\b429\b|rate limit/gi) ?? []).length;
+  const cleaned = text.replace(/RATE_LIMIT_CONTAMINATED[:=]\s*NO/gi, "");
+  return (cleaned.match(/rate limit|http\s+429|status(?:\s+code)?\s+429|\b429\b[^\n]{0,80}(?:too many|rate)/gi) ?? []).length;
 }
 
 function countBy(values: string[]): Record<string, number> {
@@ -275,8 +296,16 @@ function stringValue(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
-if (process.argv[1]?.endsWith("session-analyzer.ts")) {
+async function main(args: string[]): Promise<void> {
   const [sessionPath, repoRoot, sydesPath, runJsonPath, finalDiffPath, repoTestsPath, oraclePath, outputPath] =
-    process.argv.slice(2);
+    args;
   await analyzeSession({ sessionPath, repoRoot, sydesPath, runJsonPath, finalDiffPath, repoTestsPath, oraclePath, outputPath });
+}
+
+const scriptArgIndex = process.argv.findIndex((arg) => arg.endsWith("session-analyzer.ts"));
+if (scriptArgIndex >= 0) {
+  void main(process.argv.slice(scriptArgIndex + 1)).catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
 }

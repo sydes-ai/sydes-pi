@@ -245,13 +245,13 @@ function aggregateUsage(entries: unknown[]): Record<string, number | null> {
   }
   return {
     apiCalls: apiCalls || null,
-    inputTokens: totals.inputTokens ?? totals.promptTokens ?? totals.input ?? null,
-    cachedTokens: totals.cacheReadTokens ?? totals.cachedTokens ?? totals.cacheRead ?? null,
-    cacheWriteTokens: totals.cacheWriteTokens ?? totals.cacheWrite ?? null,
-    outputTokens: totals.outputTokens ?? totals.completionTokens ?? totals.output ?? null,
-    reasoningTokens: totals.reasoningTokens ?? null,
-    totalTokens: totals.totalTokens ?? null,
-    totalCost: totals.totalCost ?? totals["cost.total"] ?? null
+    inputTokens: totals.inputTokens ?? totals.input_tokens ?? totals.promptTokens ?? totals.prompt_tokens ?? totals.input ?? null,
+    cachedTokens: totals.cacheReadTokens ?? totals.cache_read_tokens ?? totals.cachedTokens ?? totals.cached_tokens ?? totals.cacheRead ?? null,
+    cacheWriteTokens: totals.cacheWriteTokens ?? totals.cache_write_tokens ?? totals.cacheWrite ?? null,
+    outputTokens: totals.outputTokens ?? totals.output_tokens ?? totals.completionTokens ?? totals.completion_tokens ?? totals.output ?? null,
+    reasoningTokens: totals.reasoningTokens ?? totals.reasoning_tokens ?? null,
+    totalTokens: totals.totalTokens ?? totals.total_tokens ?? null,
+    totalCost: totals.totalCost ?? totals.total_cost ?? totals["cost.total"] ?? null
   };
 }
 

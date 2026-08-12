@@ -17,7 +17,10 @@
     "smoke:drift-replay": "vite-node scripts/smoke-drift-replay.ts",
     "smoke:pi": "vite-node scripts/smoke-pi.ts",
     "live:sydes": "vite-node scripts/run-live-sydes.ts",
-    "analyze:latest": "vite-node scripts/analyze-latest.ts"
+    "analyze:latest": "vite-node scripts/analyze-latest.ts",
+    "bench": "SYDES_BENCH_ENTRY=1 vite-node scripts/bench.ts",
+    "bench:pair": "vite-node scripts/bench-pair.ts",
+    "bench:report": "vite-node scripts/bench-report.ts"
   },
   "keywords": [
     "sydes",

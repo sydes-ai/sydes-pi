@@ -1,0 +1,15 @@
+{
+  "id": "pokemon-hp-zero",
+  "sourceRepo": "~/sample_repos/pokemon-api",
+  "baseCommit": "5d6a96f373b67afddbafaa0ab7d26e61fb3bf3f0",
+  "taskPrompt": "POST /api/v1/pokemon with hp=0 must return HTTP 400; preserve existing valid POST behavior. Update or add the relevant tests, run the affected tests, and make only the minimal necessary changes.",
+  "setupCommand": "",
+  "preTestCommand": "go test ./...",
+  "oracleCommand": "python3 ~/Projects/sydes-agent/benchmarks/oracles/pokemon_hp_zero_oracle.py --repo {repo}",
+  "language": "go",
+  "framework": "gin",
+  "metadata": {
+    "domain": "backend-api",
+    "route": "POST /api/v1/pokemon"
+  }
+}

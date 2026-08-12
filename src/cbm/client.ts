@@ -2,7 +2,7 @@ import { loadConfig } from "../config.js";
 import { CliCbmTransport, createDefaultTransport } from "./transport.js";
 import type { CbmArgs, CbmCallOptions, CbmClientOptions, CbmCommandResult, CbmTransport } from "./types.js";
 
-export const DEFAULT_INDEX_TIMEOUT_MS = 180_000;
+export const DEFAULT_INDEX_TIMEOUT_MS = 300_000;
 
 export class CbmClient {
   readonly bin: string;

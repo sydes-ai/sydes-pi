@@ -1,12 +1,15 @@
 import { loadConfig } from "../config.js";
 import { CliCbmTransport, createDefaultTransport } from "./transport.js";
-import type { CbmArgs, CbmClientOptions, CbmCommandResult, CbmTransport } from "./types.js";
+import type { CbmArgs, CbmCallOptions, CbmClientOptions, CbmCommandResult, CbmTransport } from "./types.js";
+
+export const DEFAULT_INDEX_TIMEOUT_MS = 180_000;
 
 export class CbmClient {
   readonly bin: string;
   readonly cwd?: string;
   readonly env: NodeJS.ProcessEnv;
   readonly transport: CbmTransport;
+  readonly indexTimeoutMs: number;
   private listProjectsCache: Promise<CbmCommandResult> | null = null;
 
   constructor(options: CbmClientOptions = {}) {
@@ -14,6 +17,7 @@ export class CbmClient {
     this.bin = options.bin ?? config.codebaseMemoryBin;
     this.cwd = options.cwd;
     this.env = options.env ?? process.env;
+    this.indexTimeoutMs = options.indexTimeoutMs ?? DEFAULT_INDEX_TIMEOUT_MS;
     this.transport =
       options.transport ??
       (options.preferPersistent === false
@@ -21,8 +25,8 @@ export class CbmClient {
         : createDefaultTransport(options));
   }
 
-  run<T = unknown>(tool: string, args: CbmArgs = {}): Promise<CbmCommandResult<T>> {
-    return this.transport.callTool<T>(tool, args);
+  run<T = unknown>(tool: string, args: CbmArgs = {}, options: CbmCallOptions = {}): Promise<CbmCommandResult<T>> {
+    return this.transport.callTool<T>(tool, args, options);
   }
 
   listProjects(): Promise<CbmCommandResult> {
@@ -32,13 +36,13 @@ export class CbmClient {
     return this.listProjectsCache;
   }
 
-  indexRepository(repoPath: string, name?: string): Promise<CbmCommandResult> {
+  indexRepository(repoPath: string, name?: string, options: CbmCallOptions = {}): Promise<CbmCommandResult> {
     this.listProjectsCache = null;
     return this.run("index_repository", {
       "repo-path": repoPath,
       name,
       mode: "fast"
-    });
+    }, { timeoutMs: options.timeoutMs ?? this.indexTimeoutMs });
   }
 
   indexStatus(project: string, verbose = true): Promise<CbmCommandResult> {

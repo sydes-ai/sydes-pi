@@ -117,6 +117,31 @@ describe("Phase 1 exploration policy", () => {
     expect(client.indexRepository).toHaveBeenCalledTimes(1);
   });
 
+  it("passes indexing timeout separately from readiness timeout", async () => {
+    const unseen = "/tmp/pokemon-api-index-timeout";
+    let time = 0;
+    const client = makeClient({
+      listProjects: vi
+        .fn()
+        .mockResolvedValueOnce(envelope({ projects: [] }))
+        .mockResolvedValue(envelope({ projects: [{ name: "index-timeout-project", root_path: unseen }] })),
+      indexRepository: vi.fn(async () => envelope({ project: "index-timeout-project" })),
+      indexStatus: vi.fn(async () => envelope({ project: "index-timeout-project", status: "indexing", nodes: 0, edges: 0, root_path: unseen })),
+      searchGraphByArgs: vi.fn(async () => envelope({ cols: ["qn"], rows: [], total: 0 }))
+    });
+    const resolution = await ensureProjectForRepo(unseen, client, {
+      allowIndex: true,
+      indexTimeoutMs: 180_000,
+      readinessProbeQuery: "AddPokemon",
+      readinessTimeoutMs: 75,
+      now: () => (time += 25),
+      sleep: async () => undefined
+    });
+    expect(client.indexRepository).toHaveBeenCalledWith(unseen, undefined, { timeoutMs: 180_000 });
+    expect(resolution.readinessStrategy).toContain("timeout");
+    expect(resolution.readinessWaitMs).toBeLessThan(180_000);
+  });
+
   it("fresh index polls until the exact project is query-visible", async () => {
     const unseen = "/tmp/pokemon-api-fresh";
     let time = 0;

@@ -21,11 +21,16 @@ export interface CbmClientOptions {
   transport?: CbmTransport;
   preferPersistent?: boolean;
   requestTimeoutMs?: number;
+  indexTimeoutMs?: number;
+}
+
+export interface CbmCallOptions {
+  timeoutMs?: number;
 }
 
 export interface CbmTransport {
   readonly kind: string;
   readonly processStartCount: number;
-  callTool<T = unknown>(tool: string, args?: CbmArgs): Promise<CbmCommandResult<T>>;
+  callTool<T = unknown>(tool: string, args?: CbmArgs, options?: CbmCallOptions): Promise<CbmCommandResult<T>>;
   close(): Promise<void> | void;
 }

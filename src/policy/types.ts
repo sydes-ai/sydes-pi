@@ -55,7 +55,7 @@ export interface PolicyCbmClient {
   readonly transportKind?: string;
   readonly processStartCount?: number;
   listProjects(): Promise<{ parsed: unknown }>;
-  indexRepository?(repoPath: string, name?: string): Promise<{ parsed: unknown }>;
+  indexRepository?(repoPath: string, name?: string, options?: { timeoutMs?: number }): Promise<{ parsed: unknown }>;
   indexStatus?(project: string, verbose?: boolean): Promise<{ parsed: unknown }>;
   searchGraphByArgs(args: Record<string, string | number | boolean | readonly (string | number | boolean)[] | undefined>): Promise<{ parsed: unknown }>;
   searchCode(project: string, pattern: string): Promise<{ parsed: unknown }>;
@@ -80,6 +80,7 @@ export interface ProjectEnsureOptions {
   cache?: Map<string, ProjectEnsureCacheEntry>;
   now?: () => number;
   resolveRepoRoot?: (repoPath: string) => Promise<string>;
+  indexTimeoutMs?: number;
   readinessProbeQuery?: string;
   readinessTimeoutMs?: number;
   readinessInitialDelayMs?: number;
@@ -92,6 +93,7 @@ export interface BuildRelevantContextOptions {
   projectCache?: Map<string, ProjectEnsureCacheEntry>;
   now?: () => number;
   resolveRepoRoot?: (repoPath: string) => Promise<string>;
+  indexTimeoutMs?: number;
   readinessTimeoutMs?: number;
   readinessInitialDelayMs?: number;
   readinessMaxDelayMs?: number;

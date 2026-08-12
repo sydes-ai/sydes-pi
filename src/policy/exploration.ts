@@ -169,7 +169,7 @@ export async function ensureProjectForRepo(
   if (!resolution.project && options.allowIndex && cbmClient.indexRepository) {
     try {
       const indexStartedAt = options.now?.() ?? performance.now();
-      await cbmClient.indexRepository(repoRoot);
+      await cbmClient.indexRepository(repoRoot, undefined, { timeoutMs: options.indexTimeoutMs });
       indexElapsedMs = Math.round((options.now?.() ?? performance.now()) - indexStartedAt);
       indexedThisSession = true;
       resolution = await resolveCbmProject(repoRoot, cbmClient, {
@@ -373,6 +373,7 @@ export async function buildRelevantContext(
         now: options.now,
         resolveRepoRoot: options.resolveRepoRoot,
         readinessProbeQuery: symbolQuery,
+        indexTimeoutMs: options.indexTimeoutMs,
         readinessTimeoutMs: options.readinessTimeoutMs,
         readinessInitialDelayMs: options.readinessInitialDelayMs,
         readinessMaxDelayMs: options.readinessMaxDelayMs,

@@ -3,7 +3,7 @@ import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { CbmClient } from "../src/cbm/client.js";
 import { CliCbmTransport, FallbackCbmTransport, PersistentCbmTransport } from "../src/cbm/transport.js";
-import type { CbmTransport } from "../src/cbm/types.js";
+import type { CbmArgs, CbmCallOptions, CbmTransport } from "../src/cbm/types.js";
 
 class FakeChild extends EventEmitter {
   stdin = new PassThrough();
@@ -42,6 +42,11 @@ class FakeChild extends EventEmitter {
 }
 
 describe("PersistentCbmTransport", () => {
+  it("ordinary CBM calls still default to the 15 second timeout", () => {
+    const transport = new PersistentCbmTransport({ bin: "/tmp/cbm" });
+    expect(transport.requestTimeoutMs).toBe(15_000);
+  });
+
   it("starts one process across multiple tool calls and correlates IDs", async () => {
     const children: FakeChild[] = [];
     const transport = new PersistentCbmTransport({
@@ -130,6 +135,25 @@ describe("PersistentCbmTransport", () => {
     await transport.close();
   });
 
+  it("uses per-call timeout overrides and keeps the command name in timeout errors", async () => {
+    const child = new FakeChild();
+    const transport = new PersistentCbmTransport({
+      bin: "/tmp/cbm",
+      requestTimeoutMs: 15_000,
+      spawnProcess: () => {
+        child.onWrite = (message) => {
+          if (message.method === "initialize") {
+            child.respond(Number(message.id), { ok: "init" });
+          }
+        };
+        return child as never;
+      }
+    });
+    const call = transport.callTool("index_repository", {}, { timeoutMs: 5 });
+    await expect(call).rejects.toThrow("index_repository");
+    await transport.close();
+  });
+
   it("closes the child process", async () => {
     const child = new FakeChild();
     const transport = new PersistentCbmTransport({
@@ -176,6 +200,72 @@ describe("FallbackCbmTransport", () => {
     await expect(transport.callTool("search_graph", {})).resolves.toMatchObject({
       transport: "cli-fallback"
     });
+  });
+
+  it("passes the same per-call timeout to persistent and CLI fallback", async () => {
+    const seen: Array<{ transport: string; timeoutMs?: number }> = [];
+    const primary: CbmTransport = {
+      kind: "persistent",
+      processStartCount: 1,
+      callTool: vi.fn(async (_tool, _args, options) => {
+        seen.push({ transport: "persistent", timeoutMs: options?.timeoutMs });
+        throw new Error("init failed");
+      }),
+      close: vi.fn()
+    };
+    const fallbackCall: CbmTransport["callTool"] = async <T,>(
+      tool: string,
+      _args?: CbmArgs,
+      options?: CbmCallOptions
+    ) => {
+      seen.push({ transport: "cli", timeoutMs: options?.timeoutMs });
+      return { command: tool, args: [], stdout: "{}", stderr: "", parsed: {} as T };
+    };
+    const fallback: CbmTransport = {
+      kind: "cli",
+      processStartCount: 1,
+      callTool: fallbackCall,
+      close: vi.fn()
+    };
+    const transport = new FallbackCbmTransport(primary, fallback);
+    await transport.callTool("index_repository", {}, { timeoutMs: 180_000 });
+    expect(seen).toEqual([
+      { transport: "persistent", timeoutMs: 180_000 },
+      { transport: "cli", timeoutMs: 180_000 }
+    ]);
+  });
+
+  it("does not run a second full custom timeout after persistent timeout", async () => {
+    let fallbackCalls = 0;
+    const fallbackCall: CbmTransport["callTool"] = async <T,>(tool: string) => {
+      fallbackCalls += 1;
+      return {
+      command: tool,
+      args: [],
+      stdout: "{}",
+      stderr: "",
+      parsed: {} as T
+      };
+    };
+    const fallback: CbmTransport = {
+      kind: "cli",
+      processStartCount: 1,
+      callTool: fallbackCall,
+      close: vi.fn()
+    };
+    const transport = new FallbackCbmTransport(
+      {
+        kind: "persistent",
+        processStartCount: 1,
+        callTool: vi.fn(async () => {
+          throw new Error("Codebase Memory MCP request timed out: index_repository");
+        }),
+        close: vi.fn()
+      },
+      fallback
+    );
+    await expect(transport.callTool("index_repository", {}, { timeoutMs: 180_000 })).rejects.toThrow("index_repository");
+    expect(fallbackCalls).toBe(0);
   });
 
   it("allows policy fail-open when both transports fail", async () => {

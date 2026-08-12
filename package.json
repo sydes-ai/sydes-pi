@@ -20,7 +20,15 @@
     "analyze:latest": "vite-node scripts/analyze-latest.ts",
     "bench": "SYDES_BENCH_ENTRY=1 vite-node scripts/bench.ts",
     "bench:pair": "vite-node scripts/bench-pair.ts",
-    "bench:report": "vite-node scripts/bench-report.ts"
+    "bench:report": "vite-node scripts/bench-report.ts",
+    "swe:import": "vite-node scripts/swe-import.ts",
+    "swe:bench": "vite-node scripts/swe-bench.ts",
+    "swe:pair": "vite-node scripts/swe-pair.ts",
+    "swe:predictions": "vite-node scripts/swe-predictions.ts",
+    "swe:grade": "vite-node scripts/swe-grade.ts",
+    "swe:parse-report": "vite-node scripts/swe-parse-report.ts",
+    "swe:report": "vite-node scripts/swe-report.ts",
+    "swe:candidates": "vite-node scripts/swe-candidates.ts"
   },
   "keywords": [
     "sydes",

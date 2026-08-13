@@ -7,6 +7,7 @@ import {
   SWE_DATASET,
   buildGradeCommand,
   buildSwePiCommand,
+  buildSweTaskPrompt,
   exportPredictions,
   importSweInstance,
   normalizeSweRow,
@@ -54,6 +55,12 @@ describe("SWE-bench importer", () => {
   it("normalizes official dataset name", () => {
     expect(normalizeSweRow(fixtureRow(), SWE_DATASET).dataset).toBe("SWE-bench/SWE-bench_Multilingual");
   });
+
+  it("preserves the raw official problem statement in the manifest", () => {
+    const manifest = normalizeSweRow(fixtureRow(), SWE_DATASET);
+    expect(manifest.problem_statement).toBe("Fix the Druid backend bug.");
+    expect(manifest.problem_statement).not.toContain("Implement the requested change");
+  });
 });
 
 describe("SWE-bench runner", () => {
@@ -82,8 +89,42 @@ describe("SWE-bench runner", () => {
     const stock = buildSwePiCommand({ ...options, mode: "stock" }, manifest, "/tmp/run/stock");
     const sydes = buildSwePiCommand({ ...options, mode: "sydes" }, manifest, "/tmp/run/sydes");
     expect(stock.prompt).toBe(sydes.prompt);
+    expect(stock.args.at(-1)).toBe(stock.prompt);
+    expect(sydes.args.at(-1)).toBe(sydes.prompt);
     expect(stock.args.slice(0, 2)).toEqual(["--model", DEFAULT_MODEL]);
     expect(sydes.args.slice(0, 2)).toEqual(["--model", DEFAULT_MODEL]);
+  });
+
+  it("wraps the runtime prompt with neutral implementation instructions", async () => {
+    const options = await makeOptions();
+    const manifest = normalizeSweRow(fixtureRow(), SWE_DATASET);
+    const command = buildSwePiCommand({ ...options, mode: "stock" }, manifest, "/tmp/run/stock");
+    expect(command.prompt).toContain("Implement the requested change in the current repository.");
+    expect(command.prompt).toContain("Inspect the relevant code, make the necessary file edits, and run relevant tests if feasible.");
+    expect(command.prompt).toContain("Do not only explain the solution.");
+    expect(command.prompt).toContain("Issue:\nFix the Druid backend bug.");
+    expect(command.prompt.endsWith(manifest.problem_statement)).toBe(true);
+  });
+
+  it("does not leak gold or test patch content into the wrapped prompt", async () => {
+    const options = await makeOptions();
+    const manifest = normalizeSweRow(fixtureRow(), SWE_DATASET);
+    const command = buildSwePiCommand({ ...options, mode: "sydes" }, manifest, "/tmp/run/sydes");
+    expect(command.prompt).not.toContain("gold solution");
+    expect(command.prompt).not.toContain("hidden test patch");
+  });
+
+  it("builds the exact SWE task prompt template", () => {
+    expect(buildSweTaskPrompt("Original issue text.")).toBe(
+      [
+        "Implement the requested change in the current repository.",
+        "",
+        "Inspect the relevant code, make the necessary file edits, and run relevant tests if feasible. Do not only explain the solution. Keep the change minimal and focused.",
+        "",
+        "Issue:",
+        "Original issue text."
+      ].join("\n")
+    );
   });
 
   it("refuses paid runs without confirmation and never retries", async () => {

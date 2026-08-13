@@ -113,6 +113,17 @@ export function normalizeSweRow(row: Record<string, unknown>, dataset: string, d
   };
 }
 
+export function buildSweTaskPrompt(problemStatement: string): string {
+  return [
+    "Implement the requested change in the current repository.",
+    "",
+    "Inspect the relevant code, make the necessary file edits, and run relevant tests if feasible. Do not only explain the solution. Keep the change minimal and focused.",
+    "",
+    "Issue:",
+    problemStatement
+  ].join("\n");
+}
+
 export function buildSwePiCommand(options: SweRunOptions, manifest: SweManifest, runDir: string): {
   command: string;
   args: string[];
@@ -120,7 +131,7 @@ export function buildSwePiCommand(options: SweRunOptions, manifest: SweManifest,
   prompt: string;
 } {
   const sessionDir = join(runDir, "pi-sessions");
-  const prompt = manifest.problem_statement;
+  const prompt = buildSweTaskPrompt(manifest.problem_statement);
   const args = ["--model", options.model, "--mode", "text", "--print", "--no-extensions"];
   if (options.mode === "sydes") {
     args.push("--extension", options.extensionPath);

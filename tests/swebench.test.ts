@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_MODEL,
   SWE_DATASET,
+  SWE_THINKING_LEVEL,
   buildGradeCommand,
   buildSwePiCommand,
   buildSweTaskPrompt,
@@ -83,6 +84,28 @@ describe("SWE-bench runner", () => {
     expect(sydes.args).toContain(options.extensionPath);
   });
 
+  it("pins the same thinking level for stock and sydes", async () => {
+    const options = await makeOptions();
+    const manifest = normalizeSweRow(fixtureRow(), SWE_DATASET);
+    const stock = buildSwePiCommand({ ...options, mode: "stock" }, manifest, "/tmp/run/stock");
+    const sydes = buildSwePiCommand({ ...options, mode: "sydes" }, manifest, "/tmp/run/sydes");
+    expect(stock.args.slice(0, 4)).toEqual(["--model", DEFAULT_MODEL, "--thinking", SWE_THINKING_LEVEL]);
+    expect(sydes.args.slice(0, 4)).toEqual(["--model", DEFAULT_MODEL, "--thinking", SWE_THINKING_LEVEL]);
+    expect(stock.args[stock.args.indexOf("--thinking") + 1]).toBe("medium");
+    expect(sydes.args[sydes.args.indexOf("--thinking") + 1]).toBe("medium");
+  });
+
+  it("keeps the mode-specific command difference to Sydes extension loading", async () => {
+    const options = await makeOptions();
+    const manifest = normalizeSweRow(fixtureRow(), SWE_DATASET);
+    const stock = buildSwePiCommand({ ...options, mode: "stock" }, manifest, "/tmp/run/stock");
+    const sydes = buildSwePiCommand({ ...options, mode: "sydes" }, manifest, "/tmp/run/sydes");
+    const stockBeforeSession = stock.args.slice(0, stock.args.indexOf("--session-dir"));
+    const sydesBeforeSession = sydes.args.slice(0, sydes.args.indexOf("--extension"));
+    expect(stockBeforeSession).toEqual(sydesBeforeSession);
+    expect(sydes.args.slice(sydes.args.indexOf("--extension"), sydes.args.indexOf("--session-dir"))).toEqual(["--extension", options.extensionPath]);
+  });
+
   it("keeps stock and sydes prompts identical with the same model", async () => {
     const options = await makeOptions();
     const manifest = normalizeSweRow(fixtureRow(), SWE_DATASET);
@@ -91,8 +114,8 @@ describe("SWE-bench runner", () => {
     expect(stock.prompt).toBe(sydes.prompt);
     expect(stock.args.at(-1)).toBe(stock.prompt);
     expect(sydes.args.at(-1)).toBe(sydes.prompt);
-    expect(stock.args.slice(0, 2)).toEqual(["--model", DEFAULT_MODEL]);
-    expect(sydes.args.slice(0, 2)).toEqual(["--model", DEFAULT_MODEL]);
+    expect(stock.args.slice(0, 4)).toEqual(["--model", DEFAULT_MODEL, "--thinking", SWE_THINKING_LEVEL]);
+    expect(sydes.args.slice(0, 4)).toEqual(["--model", DEFAULT_MODEL, "--thinking", SWE_THINKING_LEVEL]);
   });
 
   it("wraps the runtime prompt with neutral implementation instructions", async () => {

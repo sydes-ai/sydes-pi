@@ -14,6 +14,7 @@ import { analyzeSession } from "../telemetry/session-analyzer.js";
 const execFileAsync = promisify(execFile);
 export const SWE_DATASET = "SWE-bench/SWE-bench_Multilingual";
 export const DEFAULT_MODEL = "openai/gpt-5-nano";
+export const SWE_THINKING_LEVEL = "medium";
 export type SweMode = "stock" | "sydes";
 
 export interface SweManifest {
@@ -132,7 +133,7 @@ export function buildSwePiCommand(options: SweRunOptions, manifest: SweManifest,
 } {
   const sessionDir = join(runDir, "pi-sessions");
   const prompt = buildSweTaskPrompt(manifest.problem_statement);
-  const args = ["--model", options.model, "--mode", "text", "--print", "--no-extensions"];
+  const args = ["--model", options.model, "--thinking", SWE_THINKING_LEVEL, "--mode", "text", "--print", "--no-extensions"];
   if (options.mode === "sydes") {
     args.push("--extension", options.extensionPath);
   }

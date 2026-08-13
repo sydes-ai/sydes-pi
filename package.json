@@ -24,6 +24,7 @@
     "swe:import": "vite-node scripts/swe-import.ts",
     "swe:bench": "vite-node scripts/swe-bench.ts",
     "swe:pair": "vite-node scripts/swe-pair.ts",
+    "swe:repeat": "vite-node scripts/swe-repeat.ts",
     "swe:predictions": "vite-node scripts/swe-predictions.ts",
     "swe:grade": "vite-node scripts/swe-grade.ts",
     "swe:parse-report": "vite-node scripts/swe-parse-report.ts",

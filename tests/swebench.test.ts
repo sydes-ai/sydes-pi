@@ -5,9 +5,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_MODEL,
   SWE_DATASET,
+  SWE_MAX_OUTPUT_TOKENS,
+  SWE_PI_AGENT_DIR,
   SWE_THINKING_LEVEL,
   buildGradeCommand,
   buildSwePiCommand,
+  buildSwePiEnv,
   buildSweTaskPrompt,
   exportPredictions,
   importSweInstance,
@@ -95,6 +98,32 @@ describe("SWE-bench runner", () => {
     expect(sydes.args[sydes.args.indexOf("--thinking") + 1]).toBe("medium");
   });
 
+  it("uses the benchmark-local Pi agent config for both stock and sydes", async () => {
+    const options = await makeOptions();
+    const stockEnv = buildSwePiEnv({ ...options, mode: "stock" }, "/tmp/run/stock", "/tmp/run/stock/pi-sessions");
+    const sydesEnv = buildSwePiEnv({ ...options, mode: "sydes" }, "/tmp/run/sydes", "/tmp/run/sydes/pi-sessions");
+    expect(stockEnv.PI_CODING_AGENT_DIR).toBe(SWE_PI_AGENT_DIR);
+    expect(sydesEnv.PI_CODING_AGENT_DIR).toBe(SWE_PI_AGENT_DIR);
+    expect(stockEnv.PI_CODING_AGENT_DIR).toBe(sydesEnv.PI_CODING_AGENT_DIR);
+    expect(stockEnv.SYDES_RUN_DIR).toBe("");
+    expect(sydesEnv.SYDES_RUN_DIR).toBe("/tmp/run/sydes");
+  });
+
+  it("configures gpt-5-nano maxTokens in the benchmark-owned Pi models file", async () => {
+    const config = JSON.parse(await readFile(join(SWE_PI_AGENT_DIR, "models.json"), "utf8"));
+    expect(config).toEqual({
+      providers: {
+        openai: {
+          modelOverrides: {
+            "gpt-5-nano": {
+              maxTokens: SWE_MAX_OUTPUT_TOKENS
+            }
+          }
+        }
+      }
+    });
+  });
+
   it("keeps the mode-specific command difference to Sydes extension loading", async () => {
     const options = await makeOptions();
     const manifest = normalizeSweRow(fixtureRow(), SWE_DATASET);
@@ -168,6 +197,10 @@ describe("SWE-bench runner", () => {
     await expect(runSweBench(options, deps)).resolves.toBe(0);
     const diff = await readFile(join(options.artifactsRoot, options.instanceId, "empty", "stock", "final.diff"), "utf8");
     expect(diff).toBe("");
+    const spawnEnv = vi.mocked(deps.spawnPi).mock.calls[0][2].env;
+    expect(spawnEnv.PI_CODING_AGENT_DIR).toBe(SWE_PI_AGENT_DIR);
+    const listModelsCall = vi.mocked(deps.execFile).mock.calls.find((call) => call[0] === options.piBin && Array.isArray(call[1]) && call[1][0] === "--list-models");
+    expect(listModelsCall?.[2]).toMatchObject({ env: expect.objectContaining({ PI_CODING_AGENT_DIR: SWE_PI_AGENT_DIR }) });
   });
 
   it("populates reproducibility metadata", async () => {
@@ -181,9 +214,28 @@ describe("SWE-bench runner", () => {
       repo: "apache/druid",
       base_commit: "abc123",
       model: DEFAULT_MODEL,
+      thinking: SWE_THINKING_LEVEL,
+      maxTokens: SWE_MAX_OUTPUT_TOKENS,
+      piAgentDir: SWE_PI_AGENT_DIR,
       finalDiffSha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     });
     expect(run.problemStatementSha256).toHaveLength(64);
+  });
+
+  it("prints model, thinking, and max output tokens in dry-run output", async () => {
+    const options = await makeOptions({ dryRun: true, runId: "dry-output" });
+    const deps = makeDeps(options);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    let lines: string[] = [];
+    try {
+      await expect(runSweBench(options, deps)).resolves.toBe(0);
+      lines = log.mock.calls.map((call) => call.join(" "));
+    } finally {
+      log.mockRestore();
+    }
+    expect(lines).toContain(`Model: ${DEFAULT_MODEL}`);
+    expect(lines).toContain(`Thinking: ${SWE_THINKING_LEVEL}`);
+    expect(lines).toContain(`Max output tokens: ${SWE_MAX_OUTPUT_TOKENS}`);
   });
 });
 
@@ -262,6 +314,7 @@ async function makeOptions(overrides: Partial<SweRunOptions> = {}): Promise<SweR
     artifactsRoot: join(root, "artifacts"),
     piBin: "/tmp/pi",
     extensionPath: resolve("src/index.ts"),
+    piAgentDir: SWE_PI_AGENT_DIR,
     cbmBin: "/tmp/cbm",
     ...overrides,
     env: { HOME: root, OPENAI_API_KEY: "set", ...(overrides.env ?? {}) }

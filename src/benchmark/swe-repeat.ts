@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { DEFAULT_MODEL, parseSweArgs, runSweBench, type SweMode, type SweRunOptions } from "./swebench.js";
+import { DEFAULT_MODEL, SWE_MAX_OUTPUT_TOKENS, SWE_THINKING_LEVEL, parseSweArgs, runSweBench, type SweMode, type SweRunOptions } from "./swebench.js";
 
 export interface SweRepeatOptions {
   pilotPath: string;
@@ -70,6 +70,9 @@ export async function runSweRepeat(options: SweRepeatOptions, deps: SweRepeatDep
   deps.log(`SWE repeat pilot: ${pilot.name}`);
   deps.log(`Instances: ${pilot.instances.length}`);
   deps.log(`Additional paired attempts per instance: ${options.attempts}`);
+  deps.log(`Model: ${DEFAULT_MODEL}`);
+  deps.log(`Thinking: ${SWE_THINKING_LEVEL}`);
+  deps.log(`Max output tokens: ${SWE_MAX_OUTPUT_TOKENS}`);
   if (hasStartPosition(options)) {
     deps.log(`Start position: ${options.startInstance} attempt ${options.startAttempt} ${options.startMode}`);
   }

@@ -15,6 +15,8 @@ const execFileAsync = promisify(execFile);
 export const SWE_DATASET = "SWE-bench/SWE-bench_Multilingual";
 export const DEFAULT_MODEL = "openai/gpt-5-nano";
 export const SWE_THINKING_LEVEL = "medium";
+export const SWE_MAX_OUTPUT_TOKENS = 16384;
+export const SWE_PI_AGENT_DIR = resolve("benchmarks/pi-agent");
 export type SweMode = "stock" | "sydes";
 
 export interface SweManifest {
@@ -44,6 +46,7 @@ export interface SweRunOptions {
   artifactsRoot: string;
   piBin: string;
   extensionPath: string;
+  piAgentDir: string;
   cbmBin: string;
   env: NodeJS.ProcessEnv;
 }
@@ -68,6 +71,7 @@ export function parseSweArgs(argv: string[], env: NodeJS.ProcessEnv = process.en
     artifactsRoot: resolve(home, ".sydes-pi/swebench"),
     piBin: resolve("node_modules/.bin/pi"),
     extensionPath: resolve("src/index.ts"),
+    piAgentDir: SWE_PI_AGENT_DIR,
     cbmBin: resolve("node_modules/.bin/codebase-memory-mcp"),
     env
   };
@@ -141,6 +145,15 @@ export function buildSwePiCommand(options: SweRunOptions, manifest: SweManifest,
   return { command: options.piBin, args, sessionDir, prompt };
 }
 
+export function buildSwePiEnv(options: SweRunOptions, modeDir: string, sessionDir: string): NodeJS.ProcessEnv {
+  return {
+    ...options.env,
+    PI_CODING_AGENT_DIR: options.piAgentDir,
+    SYDES_RUN_DIR: options.mode === "sydes" ? modeDir : "",
+    PI_CODING_AGENT_SESSION_DIR: sessionDir
+  };
+}
+
 export async function runSweBench(options: SweRunOptions, deps: SweDeps = defaultDeps(options)): Promise<number> {
   if (!options.instanceId) {
     console.error("Missing --instance <id>.");
@@ -164,6 +177,8 @@ export async function runSweBench(options: SweRunOptions, deps: SweDeps = defaul
     console.log(`Dataset: ${manifest.dataset}`);
     console.log(`Mode: ${options.mode}`);
     console.log(`Model: ${options.model}`);
+    console.log(`Thinking: ${SWE_THINKING_LEVEL}`);
+    console.log(`Max output tokens: ${SWE_MAX_OUTPUT_TOKENS}`);
     console.log(options.dryRun ? "Dry run: no model generation will be started." : "This will make one paid model run.");
     console.log(`OPENAI_API_KEY: ${options.env.OPENAI_API_KEY ? "SET" : "MISSING"}`);
 
@@ -173,6 +188,9 @@ export async function runSweBench(options: SweRunOptions, deps: SweDeps = defaul
       runId,
       mode: options.mode,
       model: options.model,
+      thinking: SWE_THINKING_LEVEL,
+      maxTokens: SWE_MAX_OUTPUT_TOKENS,
+      piAgentDir: options.piAgentDir,
       worktree,
       repoUrl,
       dryRun: options.dryRun,
@@ -225,10 +243,23 @@ export async function runSweBench(options: SweRunOptions, deps: SweDeps = defaul
 
     const pi = buildSwePiCommand(options, manifest, modeDir);
     await mkdir(pi.sessionDir, { recursive: true });
+    const piEnv = buildSwePiEnv(options, modeDir, pi.sessionDir);
     console.log(`Pi command: ${shellQuote([pi.command, ...pi.args])}`);
     if (options.dryRun) {
       await writeFile(join(modeDir, "final.diff"), "");
-      await writeRunMetadata(modeDir, manifest, { runId, mode: options.mode, model: options.model, worktree, repoUrl, dryRun: true, startTime, finalDiffSha256: sha256("") });
+      await writeRunMetadata(modeDir, manifest, {
+        runId,
+        mode: options.mode,
+        model: options.model,
+        thinking: SWE_THINKING_LEVEL,
+        maxTokens: SWE_MAX_OUTPUT_TOKENS,
+        piAgentDir: options.piAgentDir,
+        worktree,
+        repoUrl,
+        dryRun: true,
+        startTime,
+        finalDiffSha256: sha256("")
+      });
       console.log("Dry run complete before Pi generation.");
       return 0;
     }
@@ -236,14 +267,10 @@ export async function runSweBench(options: SweRunOptions, deps: SweDeps = defaul
     if (!options.env.OPENAI_API_KEY) {
       throw new Error("OPENAI_API_KEY is missing; refusing to start paid benchmark.");
     }
-    await deps.execFile(options.piBin, ["--list-models", options.model], { env: options.env });
+    await deps.execFile(options.piBin, ["--list-models", options.model], { env: piEnv });
     const piExit = await deps.spawnPi(pi.command, pi.args, {
       cwd: worktree,
-      env: {
-        ...options.env,
-        SYDES_RUN_DIR: options.mode === "sydes" ? modeDir : "",
-        PI_CODING_AGENT_SESSION_DIR: pi.sessionDir
-      }
+      env: piEnv
     });
     if (piExit !== 0) throw new Error(`Pi exited with ${piExit}; not retrying.`);
 
@@ -256,6 +283,9 @@ export async function runSweBench(options: SweRunOptions, deps: SweDeps = defaul
       runId,
       mode: options.mode,
       model: options.model,
+      thinking: SWE_THINKING_LEVEL,
+      maxTokens: SWE_MAX_OUTPUT_TOKENS,
+      piAgentDir: options.piAgentDir,
       worktree,
       repoUrl,
       dryRun: false,

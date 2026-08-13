@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseSweRepeatArgs, runSweRepeat, type SweRepeatDeps, type SweRepeatOptions } from "../src/benchmark/swe-repeat.js";
-import type { SweRunOptions } from "../src/benchmark/swebench.js";
+import { DEFAULT_MODEL, SWE_MAX_OUTPUT_TOKENS, SWE_THINKING_LEVEL, type SweRunOptions } from "../src/benchmark/swebench.js";
 
 const tempRoots: string[] = [];
 
@@ -72,6 +72,9 @@ describe("SWE-bench repeat runner", () => {
     expect(deps.sleep).not.toHaveBeenCalled();
     expect(logs(deps)).toContain("Instances: 2");
     expect(logs(deps)).toContain("Additional paired attempts per instance: 2");
+    expect(logs(deps)).toContain(`Model: ${DEFAULT_MODEL}`);
+    expect(logs(deps)).toContain(`Thinking: ${SWE_THINKING_LEVEL}`);
+    expect(logs(deps)).toContain(`Max output tokens: ${SWE_MAX_OUTPUT_TOKENS}`);
     expect(logs(deps)).toContain("Planned mode calls: 8");
     expect(logs(deps)).toContain("Paid model calls planned: 8");
     expect(logs(deps)).toContain("Paid model calls started: 0");

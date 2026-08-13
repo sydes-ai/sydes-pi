@@ -104,6 +104,106 @@ describe("SWE-bench repeat runner", () => {
       exitCode: 0
     });
   });
+
+  it("resumes at a stock start position and omits earlier calls", async () => {
+    const options = await makeOptions({
+      attempts: 2,
+      delaySeconds: 0,
+      startInstance: "repo__one-1",
+      startAttempt: 3,
+      startMode: "stock"
+    });
+    const deps = makeDeps();
+    await expect(runSweRepeat(options, deps)).resolves.toBe(0);
+    expect(calls(deps)).toEqual([
+      ["repo__one-1", "stock", "20260813T140422Z-swe-repeat-attempt-3-repo__one-1"],
+      ["repo__one-1", "sydes", "20260813T140422Z-swe-repeat-attempt-3-repo__one-1"],
+      ["repo__two-2", "stock", "20260813T140422Z-swe-repeat-attempt-2-repo__two-2"],
+      ["repo__two-2", "sydes", "20260813T140422Z-swe-repeat-attempt-2-repo__two-2"],
+      ["repo__two-2", "stock", "20260813T140422Z-swe-repeat-attempt-3-repo__two-2"],
+      ["repo__two-2", "sydes", "20260813T140422Z-swe-repeat-attempt-3-repo__two-2"]
+    ]);
+  });
+
+  it("resumes at a sydes start position and keeps later ordering unchanged", async () => {
+    const options = await makeOptions({
+      attempts: 2,
+      delaySeconds: 0,
+      startInstance: "repo__one-1",
+      startAttempt: 2,
+      startMode: "sydes"
+    });
+    const deps = makeDeps();
+    await expect(runSweRepeat(options, deps)).resolves.toBe(0);
+    expect(calls(deps).map((call) => call.slice(0, 2))).toEqual([
+      ["repo__one-1", "sydes"],
+      ["repo__one-1", "stock"],
+      ["repo__one-1", "sydes"],
+      ["repo__two-2", "stock"],
+      ["repo__two-2", "sydes"],
+      ["repo__two-2", "stock"],
+      ["repo__two-2", "sydes"]
+    ]);
+  });
+
+  it("gives a resumed infrastructure failure a fresh run ID from the new invocation", async () => {
+    const first = await makeOptions({ attempts: 2, delaySeconds: 0 });
+    const firstDeps = makeDeps();
+    await runSweRepeat(first, firstDeps);
+    const resumed = await makeOptions({
+      attempts: 2,
+      delaySeconds: 0,
+      startInstance: "repo__one-1",
+      startAttempt: 3,
+      startMode: "stock"
+    });
+    const resumedDeps = makeDeps({ now: new Date("2026-08-13T15:00:00Z") });
+    await runSweRepeat(resumed, resumedDeps);
+    expect(calls(resumedDeps)[0]).toEqual(["repo__one-1", "stock", "20260813T150000Z-swe-repeat-attempt-3-repo__one-1"]);
+    expect(calls(resumedDeps)[0][2]).not.toBe(calls(firstDeps)[2][2]);
+  });
+
+  it("fails invalid start instance before any model call", async () => {
+    const options = await makeOptions({ attempts: 2, startInstance: "missing__repo-1", startAttempt: 3, startMode: "stock" });
+    const deps = makeDeps();
+    await expect(runSweRepeat(options, deps)).rejects.toThrow("Start instance is not in pilot: missing__repo-1");
+    expect(deps.runOne).not.toHaveBeenCalled();
+  });
+
+  it("fails invalid start attempt before any model call", async () => {
+    const options = await makeOptions({ attempts: 2, startInstance: "repo__one-1", startAttempt: 4, startMode: "stock" });
+    const deps = makeDeps();
+    await expect(runSweRepeat(options, deps)).rejects.toThrow("Start attempt must be one of: 2, 3");
+    expect(deps.runOne).not.toHaveBeenCalled();
+  });
+
+  it("fails invalid start mode while parsing", () => {
+    expect(() => parseSweRepeatArgs(["--start-instance", "repo__one-1", "--start-attempt", "3", "--start-mode", "both"])).toThrow("--start-mode must be stock or sydes");
+  });
+
+  it("requires all start position arguments together", async () => {
+    const options = await makeOptions({ attempts: 2, startInstance: "repo__one-1", startAttempt: 3 });
+    const deps = makeDeps();
+    await expect(runSweRepeat(options, deps)).rejects.toThrow("Resume requires --start-instance, --start-attempt, and --start-mode together.");
+    expect(deps.runOne).not.toHaveBeenCalled();
+  });
+
+  it("dry-run supports resume and makes zero model calls", async () => {
+    const options = await makeOptions({
+      attempts: 2,
+      dryRun: true,
+      confirmPaidRuns: false,
+      startInstance: "repo__one-1",
+      startAttempt: 3,
+      startMode: "stock"
+    });
+    const deps = makeDeps();
+    await expect(runSweRepeat(options, deps)).resolves.toBe(0);
+    expect(deps.runOne).not.toHaveBeenCalled();
+    expect(logs(deps)).toContain("Start position: repo__one-1 attempt 3 stock");
+    expect(logs(deps)).toContain("Planned mode calls: 6");
+    expect(logs(deps)).toContain("Paid model calls started: 0");
+  });
 });
 
 async function makeOptions(overrides: Partial<SweRepeatOptions> = {}): Promise<SweRepeatOptions> {
@@ -122,12 +222,12 @@ async function makeOptions(overrides: Partial<SweRepeatOptions> = {}): Promise<S
   };
 }
 
-function makeDeps(behavior: { exitCodes?: number[] } = {}): SweRepeatDeps {
+function makeDeps(behavior: { exitCodes?: number[]; now?: Date } = {}): SweRepeatDeps {
   const exitCodes = [...(behavior.exitCodes ?? [])];
   return {
     runOne: vi.fn(async () => exitCodes.shift() ?? 0),
     sleep: vi.fn(async () => undefined),
-    now: () => new Date("2026-08-13T14:04:22Z"),
+    now: () => behavior.now ?? new Date("2026-08-13T14:04:22Z"),
     log: vi.fn(),
     error: vi.fn()
   };

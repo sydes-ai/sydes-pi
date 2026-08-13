@@ -9,6 +9,9 @@ export interface SweRepeatOptions {
   delaySeconds: number;
   dryRun: boolean;
   confirmPaidRuns: boolean;
+  startInstance?: string;
+  startAttempt?: number;
+  startMode?: SweMode;
   env: NodeJS.ProcessEnv;
 }
 
@@ -38,12 +41,18 @@ export function parseSweRepeatArgs(argv: string[], env: NodeJS.ProcessEnv = proc
   const pilotPath = valueAfter(argv, "--pilot") ?? valueWithPrefix(argv, "--pilot=") ?? "benchmarks/swebench/pilot.json";
   const attemptsText = valueAfter(argv, "--attempts") ?? valueWithPrefix(argv, "--attempts=") ?? "1";
   const delayText = valueAfter(argv, "--delay-seconds") ?? valueWithPrefix(argv, "--delay-seconds=") ?? "90";
+  const startInstance = valueAfter(argv, "--start-instance") ?? valueWithPrefix(argv, "--start-instance=");
+  const startAttemptText = valueAfter(argv, "--start-attempt") ?? valueWithPrefix(argv, "--start-attempt=");
+  const startModeText = valueAfter(argv, "--start-mode") ?? valueWithPrefix(argv, "--start-mode=");
   return {
     pilotPath: resolve(pilotPath),
     attempts: parseNonNegativeInt(attemptsText, "--attempts"),
     delaySeconds: parseNonNegativeNumber(delayText, "--delay-seconds"),
     dryRun: argv.includes("--dry-run"),
     confirmPaidRuns: argv.includes("--confirm-paid-runs"),
+    startInstance,
+    startAttempt: startAttemptText === undefined ? undefined : parseNonNegativeInt(startAttemptText, "--start-attempt"),
+    startMode: startModeText === undefined ? undefined : parseStartMode(startModeText),
     env
   };
 }
@@ -56,10 +65,14 @@ export async function runSweRepeat(options: SweRepeatOptions, deps: SweRepeatDep
   }
 
   const pilot = await readPilot(options.pilotPath);
-  const planned = planRepeatCalls(options, pilot, deps.now());
+  const allPlanned = planRepeatCalls(options, pilot, deps.now());
+  const planned = applyStartPosition(allPlanned, options);
   deps.log(`SWE repeat pilot: ${pilot.name}`);
   deps.log(`Instances: ${pilot.instances.length}`);
   deps.log(`Additional paired attempts per instance: ${options.attempts}`);
+  if (hasStartPosition(options)) {
+    deps.log(`Start position: ${options.startInstance} attempt ${options.startAttempt} ${options.startMode}`);
+  }
   deps.log(`Planned mode calls: ${planned.length}`);
   deps.log(`Paid model calls planned: ${planned.length}`);
   if (options.dryRun) deps.log("Paid model calls started: 0");
@@ -134,6 +147,30 @@ function planRepeatCalls(options: SweRepeatOptions, pilot: SwePilot, start: Date
   return calls;
 }
 
+function applyStartPosition(calls: PlannedCall[], options: SweRepeatOptions): PlannedCall[] {
+  if (!hasStartPosition(options)) return calls;
+  if (!options.startInstance || options.startAttempt === undefined || !options.startMode) {
+    throw new Error("Resume requires --start-instance, --start-attempt, and --start-mode together.");
+  }
+  const index = calls.findIndex((call) => (
+    call.instanceId === options.startInstance
+    && call.attempt === options.startAttempt
+    && call.mode === options.startMode
+  ));
+  if (index < 0) {
+    const instances = new Set(calls.map((call) => call.instanceId));
+    if (!instances.has(options.startInstance)) throw new Error(`Start instance is not in pilot: ${options.startInstance}`);
+    const attempts = [...new Set(calls.map((call) => call.attempt))].sort((a, b) => a - b).join(", ");
+    if (!calls.some((call) => call.attempt === options.startAttempt)) throw new Error(`Start attempt must be one of: ${attempts || "(none)"}`);
+    throw new Error(`Start position is not planned: ${options.startInstance} attempt ${options.startAttempt} ${options.startMode}`);
+  }
+  return calls.slice(index);
+}
+
+function hasStartPosition(options: SweRepeatOptions): boolean {
+  return options.startInstance !== undefined || options.startAttempt !== undefined || options.startMode !== undefined;
+}
+
 async function writeAttemptStatus(path: string, call: PlannedCall, status: string, exitCode: number): Promise<void> {
   await mkdir(path, { recursive: true });
   await writeFile(join(path, "repeat-status.json"), `${JSON.stringify({ ...call, status, exitCode }, null, 2)}\n`);
@@ -176,6 +213,11 @@ function parseNonNegativeNumber(value: string, flag: string): number {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) throw new Error(`${flag} must be a non-negative number`);
   return parsed;
+}
+
+function parseStartMode(value: string): SweMode {
+  if (value === "stock" || value === "sydes") return value;
+  throw new Error("--start-mode must be stock or sydes");
 }
 
 function safeId(value: string): string {

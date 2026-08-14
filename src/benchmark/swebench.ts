@@ -9,7 +9,7 @@ import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { CbmClient } from "../cbm/client.js";
 import type { SydesIntegrationMode } from "../config.js";
-import { MODEL_CALL_MIN_INTERVAL_ENV, MODEL_CALL_PACING_EVENTS_ENV } from "./pi-request-pacer.js";
+import { MODEL_CALL_MIN_INTERVAL_ENV, MODEL_CALL_PACING_EVENTS_ENV, MODEL_TPM_BUDGET_ENV } from "./pi-request-pacer.js";
 import { buildRelevantContext, ensureProjectForRepo } from "../policy/exploration.js";
 import { analyzeSession } from "../telemetry/session-analyzer.js";
 
@@ -54,6 +54,7 @@ export interface SweRunOptions {
   cbmBin: string;
   sydesIntegrationMode?: SydesIntegrationMode;
   modelCallMinIntervalMs: number;
+  modelTpmBudget: number;
   env: NodeJS.ProcessEnv;
 }
 
@@ -81,6 +82,13 @@ export function parseSweArgs(argv: string[], env: NodeJS.ProcessEnv = process.en
     piAgentDir: SWE_PI_AGENT_DIR,
     cbmBin: resolve("node_modules/.bin/codebase-memory-mcp"),
     sydesIntegrationMode: parseSydesIntegrationMode(valueAfter(argv, "--sydes-integration-mode") ?? valueWithPrefix(argv, "--sydes-integration-mode=")),
+    modelTpmBudget: parseNonNegativeInt(
+      valueAfter(argv, "--model-tpm-budget")
+        ?? valueWithPrefix(argv, "--model-tpm-budget=")
+        ?? env[MODEL_TPM_BUDGET_ENV]
+        ?? "0",
+      "--model-tpm-budget"
+    ),
     modelCallMinIntervalMs: parseNonNegativeInt(
       valueAfter(argv, "--model-call-min-interval-ms")
         ?? valueWithPrefix(argv, "--model-call-min-interval-ms=")
@@ -153,7 +161,7 @@ export function buildSwePiCommand(options: SweRunOptions, manifest: SweManifest,
   const sessionDir = join(runDir, "pi-sessions");
   const prompt = buildSweTaskPrompt(manifest.problem_statement);
   const args = ["--model", options.model, "--thinking", SWE_THINKING_LEVEL, "--mode", "text", "--print", "--no-extensions"];
-  if (options.modelCallMinIntervalMs > 0) {
+  if (requestPacingEnabled(options)) {
     args.push("--extension", options.requestPacerExtensionPath);
   }
   if (options.mode === "sydes") {
@@ -167,6 +175,7 @@ export function buildSwePiEnv(options: SweRunOptions, modeDir: string, sessionDi
   const {
     SYDES_INTEGRATION_MODE: _discarded,
     [MODEL_CALL_MIN_INTERVAL_ENV]: _discardedMinInterval,
+    [MODEL_TPM_BUDGET_ENV]: _discardedTpmBudget,
     [MODEL_CALL_PACING_EVENTS_ENV]: _discardedEvents,
     ...baseEnv
   } = options.env;
@@ -177,8 +186,9 @@ export function buildSwePiEnv(options: SweRunOptions, modeDir: string, sessionDi
     SYDES_RUN_DIR: options.mode === "sydes" ? modeDir : "",
     PI_CODING_AGENT_SESSION_DIR: sessionDir,
     ...(options.mode === "sydes" && sydesIntegrationMode ? { SYDES_INTEGRATION_MODE: sydesIntegrationMode } : {}),
-    ...(options.modelCallMinIntervalMs > 0 ? {
-      [MODEL_CALL_MIN_INTERVAL_ENV]: String(options.modelCallMinIntervalMs),
+    ...(requestPacingEnabled(options) ? {
+      ...(options.modelTpmBudget > 0 ? { [MODEL_TPM_BUDGET_ENV]: String(options.modelTpmBudget) } : {}),
+      ...(options.modelTpmBudget <= 0 && options.modelCallMinIntervalMs > 0 ? { [MODEL_CALL_MIN_INTERVAL_ENV]: String(options.modelCallMinIntervalMs) } : {}),
       [MODEL_CALL_PACING_EVENTS_ENV]: join(modeDir, "provider-pacing-events.jsonl")
     } : {})
   };
@@ -209,7 +219,7 @@ export async function runSweBench(options: SweRunOptions, deps: SweDeps = defaul
     console.log(`Model: ${options.model}`);
     console.log(`Thinking: ${SWE_THINKING_LEVEL}`);
     console.log(`Max output tokens: ${SWE_MAX_OUTPUT_TOKENS}`);
-    console.log(`Provider request pacing: ${options.modelCallMinIntervalMs > 0 ? `${options.modelCallMinIntervalMs}ms` : "disabled"}`);
+    console.log(`Provider request pacing: ${formatRequestPacing(options)}`);
     console.log(options.dryRun ? "Dry run: no model generation will be started." : "This will make one paid model run.");
     console.log(`OPENAI_API_KEY: ${options.env.OPENAI_API_KEY ? "SET" : "MISSING"}`);
 
@@ -570,9 +580,22 @@ function parseNonNegativeInt(value: string, flag: string): number {
 
 function requestPacingMetadata(options: SweRunOptions): Record<string, unknown> {
   return {
-    enabled: options.modelCallMinIntervalMs > 0,
-    minIntervalMs: options.modelCallMinIntervalMs
+    enabled: requestPacingEnabled(options),
+    strategy: options.modelTpmBudget > 0 ? "rolling-tpm" : options.modelCallMinIntervalMs > 0 ? "fixed-min-interval" : "disabled",
+    tpmBudget: options.modelTpmBudget,
+    windowMs: options.modelTpmBudget > 0 ? 60_000 : undefined,
+    minIntervalMs: options.modelTpmBudget > 0 ? 0 : options.modelCallMinIntervalMs
   };
+}
+
+function requestPacingEnabled(options: SweRunOptions): boolean {
+  return options.modelTpmBudget > 0 || options.modelCallMinIntervalMs > 0;
+}
+
+function formatRequestPacing(options: SweRunOptions): string {
+  if (options.modelTpmBudget > 0) return `rolling TPM budget ${options.modelTpmBudget}/60s`;
+  if (options.modelCallMinIntervalMs > 0) return `${options.modelCallMinIntervalMs}ms fixed minimum interval`;
+  return "disabled";
 }
 
 function stringField(row: Record<string, unknown>, key: string): string {

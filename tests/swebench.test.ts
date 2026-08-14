@@ -22,7 +22,7 @@ import {
   type SweDeps,
   type SweRunOptions
 } from "../src/benchmark/swebench.js";
-import { MODEL_CALL_MIN_INTERVAL_ENV, MODEL_CALL_PACING_EVENTS_ENV } from "../src/benchmark/pi-request-pacer.js";
+import { MODEL_CALL_MIN_INTERVAL_ENV, MODEL_CALL_PACING_EVENTS_ENV, MODEL_TPM_BUDGET_ENV } from "../src/benchmark/pi-request-pacer.js";
 
 const tempRoots: string[] = [];
 
@@ -89,8 +89,8 @@ describe("SWE-bench runner", () => {
     expect(sydes.args).toContain(options.extensionPath);
   });
 
-  it("loads only the benchmark pacer extension in stock when request pacing is enabled", async () => {
-    const options = await makeOptions({ modelCallMinIntervalMs: 65000 });
+  it("loads only the benchmark pacer extension in stock when TPM pacing is enabled", async () => {
+    const options = await makeOptions({ modelTpmBudget: 180000 });
     const manifest = normalizeSweRow(fixtureRow(), SWE_DATASET);
     const stock = buildSwePiCommand({ ...options, mode: "stock" }, manifest, "/tmp/run/stock");
     const extensionArgs = extensionValues(stock.args);
@@ -99,8 +99,8 @@ describe("SWE-bench runner", () => {
     expect(extensionArgs).not.toContain(options.extensionPath);
   });
 
-  it("loads the common pacer before Sydes when request pacing is enabled", async () => {
-    const options = await makeOptions({ modelCallMinIntervalMs: 65000 });
+  it("loads the common pacer before Sydes when TPM pacing is enabled", async () => {
+    const options = await makeOptions({ modelTpmBudget: 180000 });
     const manifest = normalizeSweRow(fixtureRow(), SWE_DATASET);
     const sydes = buildSwePiCommand({ ...options, mode: "sydes" }, manifest, "/tmp/run/sydes");
     expect(extensionValues(sydes.args)).toEqual([SWE_REQUEST_PACER_EXTENSION_PATH, options.extensionPath]);
@@ -120,10 +120,11 @@ describe("SWE-bench runner", () => {
   it("uses the benchmark-local Pi agent config for both stock and sydes", async () => {
     const options = await makeOptions({
       sydesIntegrationMode: "tool-middleware",
-      modelCallMinIntervalMs: 65000,
+      modelTpmBudget: 180000,
       env: {
         SYDES_INTEGRATION_MODE: "graph-guidance",
         [MODEL_CALL_MIN_INTERVAL_ENV]: "12",
+        [MODEL_TPM_BUDGET_ENV]: "34",
         [MODEL_CALL_PACING_EVENTS_ENV]: "/tmp/old-events.jsonl"
       }
     });
@@ -136,8 +137,10 @@ describe("SWE-bench runner", () => {
     expect(sydesEnv.SYDES_RUN_DIR).toBe("/tmp/run/sydes");
     expect(stockEnv.SYDES_INTEGRATION_MODE).toBeUndefined();
     expect(sydesEnv.SYDES_INTEGRATION_MODE).toBe("tool-middleware");
-    expect(stockEnv[MODEL_CALL_MIN_INTERVAL_ENV]).toBe("65000");
-    expect(sydesEnv[MODEL_CALL_MIN_INTERVAL_ENV]).toBe("65000");
+    expect(stockEnv[MODEL_TPM_BUDGET_ENV]).toBe("180000");
+    expect(sydesEnv[MODEL_TPM_BUDGET_ENV]).toBe("180000");
+    expect(stockEnv[MODEL_CALL_MIN_INTERVAL_ENV]).toBeUndefined();
+    expect(sydesEnv[MODEL_CALL_MIN_INTERVAL_ENV]).toBeUndefined();
     expect(stockEnv[MODEL_CALL_PACING_EVENTS_ENV]).toBe("/tmp/run/stock/provider-pacing-events.jsonl");
     expect(sydesEnv[MODEL_CALL_PACING_EVENTS_ENV]).toBe("/tmp/run/sydes/provider-pacing-events.jsonl");
   });
@@ -156,10 +159,34 @@ describe("SWE-bench runner", () => {
   });
 
   it("can configure benchmark provider request pacing from CLI or env", () => {
-    const cli = parseSweArgs(["--instance", "apache__druid-13704", "--mode", "stock", "--model-call-min-interval-ms", "65000"], { HOME: "/tmp/home" });
-    const env = parseSweArgs(["--instance", "apache__druid-13704", "--mode", "stock"], { HOME: "/tmp/home", [MODEL_CALL_MIN_INTERVAL_ENV]: "1234" });
-    expect(cli.modelCallMinIntervalMs).toBe(65000);
-    expect(env.modelCallMinIntervalMs).toBe(1234);
+    const cli = parseSweArgs(["--instance", "apache__druid-13704", "--mode", "stock", "--model-tpm-budget", "180000"], { HOME: "/tmp/home" });
+    const env = parseSweArgs(["--instance", "apache__druid-13704", "--mode", "stock"], { HOME: "/tmp/home", [MODEL_TPM_BUDGET_ENV]: "1234" });
+    const fixed = parseSweArgs(["--instance", "apache__druid-13704", "--mode", "stock", "--model-call-min-interval-ms", "65000"], { HOME: "/tmp/home" });
+    expect(cli.modelTpmBudget).toBe(180000);
+    expect(env.modelTpmBudget).toBe(1234);
+    expect(fixed.modelCallMinIntervalMs).toBe(65000);
+  });
+
+  it("uses identical TPM budget and pacer for stock and sydes", async () => {
+    const options = await makeOptions({ modelTpmBudget: 180000, sydesIntegrationMode: "tool-middleware" });
+    const manifest = normalizeSweRow(fixtureRow(), SWE_DATASET);
+    const stock = buildSwePiCommand({ ...options, mode: "stock" }, manifest, "/tmp/run/stock");
+    const sydes = buildSwePiCommand({ ...options, mode: "sydes" }, manifest, "/tmp/run/sydes");
+    const stockEnv = buildSwePiEnv({ ...options, mode: "stock" }, "/tmp/run/stock", "/tmp/run/stock/pi-sessions");
+    const sydesEnv = buildSwePiEnv({ ...options, mode: "sydes" }, "/tmp/run/sydes", "/tmp/run/sydes/pi-sessions");
+
+    expect(extensionValues(stock.args)).toEqual([SWE_REQUEST_PACER_EXTENSION_PATH]);
+    expect(extensionValues(sydes.args)).toEqual([SWE_REQUEST_PACER_EXTENSION_PATH, options.extensionPath]);
+    expect(stockEnv[MODEL_TPM_BUDGET_ENV]).toBe("180000");
+    expect(sydesEnv[MODEL_TPM_BUDGET_ENV]).toBe("180000");
+    expect(sydesEnv.SYDES_INTEGRATION_MODE).toBe("tool-middleware");
+  });
+
+  it("prefers TPM pacing over the legacy fixed interval when both are configured", async () => {
+    const options = await makeOptions({ modelTpmBudget: 180000, modelCallMinIntervalMs: 65000 });
+    const stockEnv = buildSwePiEnv(options, "/tmp/run/stock", "/tmp/run/stock/pi-sessions");
+    expect(stockEnv[MODEL_TPM_BUDGET_ENV]).toBe("180000");
+    expect(stockEnv[MODEL_CALL_MIN_INTERVAL_ENV]).toBeUndefined();
   });
 
   it("configures gpt-5-nano maxTokens in the benchmark-owned Pi models file", async () => {
@@ -272,6 +299,8 @@ describe("SWE-bench runner", () => {
       piAgentDir: SWE_PI_AGENT_DIR,
       requestPacing: {
         enabled: false,
+        strategy: "disabled",
+        tpmBudget: 0,
         minIntervalMs: 0
       },
       finalDiffSha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -280,7 +309,7 @@ describe("SWE-bench runner", () => {
   });
 
   it("records Sydes integration mode in benchmark metadata", async () => {
-    const options = await makeOptions({ mode: "sydes", dryRun: true, runId: "middleware-meta", sydesIntegrationMode: "tool-middleware", modelCallMinIntervalMs: 65000 });
+    const options = await makeOptions({ mode: "sydes", dryRun: true, runId: "middleware-meta", sydesIntegrationMode: "tool-middleware", modelTpmBudget: 180000 });
     const deps = makeDeps(options);
     await runSweBench(options, deps);
     const run = JSON.parse(await readFile(join(options.artifactsRoot, options.instanceId, "middleware-meta", "sydes", "run.json"), "utf8"));
@@ -292,7 +321,10 @@ describe("SWE-bench runner", () => {
       maxTokens: SWE_MAX_OUTPUT_TOKENS,
       requestPacing: {
         enabled: true,
-        minIntervalMs: 65000
+        strategy: "rolling-tpm",
+        tpmBudget: 180000,
+        windowMs: 60000,
+        minIntervalMs: 0
       }
     });
   });
@@ -311,6 +343,20 @@ describe("SWE-bench runner", () => {
     expect(lines).toContain(`Model: ${DEFAULT_MODEL}`);
     expect(lines).toContain(`Thinking: ${SWE_THINKING_LEVEL}`);
     expect(lines).toContain(`Max output tokens: ${SWE_MAX_OUTPUT_TOKENS}`);
+  });
+
+  it("prints rolling TPM pacing in dry-run output", async () => {
+    const options = await makeOptions({ dryRun: true, runId: "dry-tpm-output", modelTpmBudget: 180000 });
+    const deps = makeDeps(options);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    let lines: string[] = [];
+    try {
+      await expect(runSweBench(options, deps)).resolves.toBe(0);
+      lines = log.mock.calls.map((call) => call.join(" "));
+    } finally {
+      log.mockRestore();
+    }
+    expect(lines).toContain("Provider request pacing: rolling TPM budget 180000/60s");
   });
 });
 
@@ -394,6 +440,7 @@ async function makeOptions(overrides: Partial<SweRunOptions> = {}): Promise<SweR
     cbmBin: "/tmp/cbm",
     sydesIntegrationMode: undefined,
     modelCallMinIntervalMs: 0,
+    modelTpmBudget: 0,
     ...overrides,
     env: { HOME: root, OPENAI_API_KEY: "set", ...(overrides.env ?? {}) }
   };

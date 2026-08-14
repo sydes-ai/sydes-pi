@@ -17,6 +17,7 @@ export {
   maybeSendImpactGuidance,
   observeMutationResult,
   recordExplorationToolResult,
+  SYDES_PATH_RECOVERY_HEADER,
   SYDES_STRUCTURAL_CONTEXT_HEADER,
   renderDebugContext,
   renderImpactDebugContext,

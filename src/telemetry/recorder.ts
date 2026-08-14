@@ -23,6 +23,15 @@ export interface ExplorationToolEvent {
     relationshipsReturned: number;
     filesSuggested: string[];
     testsSuggested: string[];
+    resolvedRelatedSymbols?: Array<{ name: string; filePath: string; kind?: string }>;
+    relatedCodeFilesSuggested?: string[];
+    relatedTestFilesSuggested?: string[];
+    failedReadRecoveryGenerated?: boolean;
+    failedReadRecoveryCandidates?: string[];
+    repeatedReadUnchanged?: boolean;
+    repeatedReadAfterModification?: boolean;
+    repeatedEnrichmentAvoided?: boolean;
+    filesystemReadAvoided?: boolean;
     skippedReason?: string;
     failureReason?: string;
   };

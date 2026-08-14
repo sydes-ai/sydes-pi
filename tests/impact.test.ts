@@ -83,7 +83,9 @@ function makeState(): SydesRuntimeState {
       sequence: 0,
       startedAt: 0,
       seenTargets: new Set(),
-      enrichedReadTargets: new Set()
+      enrichedReadTargets: new Set(),
+      readFileFingerprints: new Map(),
+      surfacedGraphFiles: new Set()
     }
   };
 }

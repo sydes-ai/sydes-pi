@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { posix as pathPosix } from "node:path";
 import type {
   BeforeAgentStartEvent,
   BeforeAgentStartEventResult,
@@ -29,6 +31,7 @@ import { SydesTelemetryRecorder, type ExplorationToolEvent } from "./telemetry/r
 
 const STRUCTURAL_CONTEXT_CHAR_BUDGET = 2400;
 export const SYDES_STRUCTURAL_CONTEXT_HEADER = "[Sydes structural context]";
+export const SYDES_PATH_RECOVERY_HEADER = "--- Sydes path recovery ---";
 
 export interface SydesExtensionContext {
   registerTool?: (tool: unknown) => void;
@@ -91,6 +94,8 @@ export interface ExplorationTelemetryState {
   startedAt: number;
   seenTargets: Set<string>;
   enrichedReadTargets: Set<string>;
+  readFileFingerprints: Map<string, string>;
+  surfacedGraphFiles: Set<string>;
 }
 
 export interface SydesToolResultEventResult {
@@ -132,7 +137,9 @@ export default function sydesPiExtension(pi: ExtensionAPI): void {
       sequence: 0,
       startedAt: Date.now(),
       seenTargets: new Set(),
-      enrichedReadTargets: new Set()
+      enrichedReadTargets: new Set(),
+      readFileFingerprints: new Map(),
+      surfacedGraphFiles: new Set()
     }
   };
 
@@ -343,7 +350,9 @@ export async function handleToolMiddlewareToolResult(
   let enrichment: ExplorationToolEvent["enrichment"];
   let footer: string | undefined;
   if (event.toolName === "read") {
-    const readEnrichment = await maybeBuildReadEnrichment(event, repoPath, state, cbm, normalized.normalizedTarget);
+    const readEnrichment = event.isError
+      ? await maybeBuildFailedReadRecovery(event, repoPath, state, cbm, normalized.normalizedTarget)
+      : await maybeBuildReadEnrichment(event, repoPath, state, cbm, normalized.normalizedTarget);
     enrichment = readEnrichment.telemetry;
     footer = readEnrichment.footer;
   } else {
@@ -391,6 +400,13 @@ interface StructuralRelationship {
   type: string;
 }
 
+interface NavigationSuggestions {
+  sameFileSymbols: string[];
+  resolvedRelatedSymbols: Array<{ name: string; filePath: string; kind?: string }>;
+  relatedCodeFilesSuggested: string[];
+  relatedTestFilesSuggested: string[];
+}
+
 async function maybeBuildReadEnrichment(
   event: ToolResultEvent,
   repoPath: string,
@@ -420,10 +436,24 @@ async function maybeBuildReadEnrichment(
   if (!anchorPath) {
     return base({ skippedReason: "no_anchor_path" });
   }
-  if (state.explorationTelemetry.enrichedReadTargets.has(anchorPath)) {
-    return base({ skippedReason: "already_enriched" });
+  const fingerprint = fingerprintReadContent(event.content);
+  const previousFingerprint = state.explorationTelemetry.readFileFingerprints.get(anchorPath);
+  const repeatedReadUnchanged = previousFingerprint === fingerprint;
+  const repeatedReadAfterModification = !!previousFingerprint && previousFingerprint !== fingerprint;
+  state.explorationTelemetry.readFileFingerprints.set(anchorPath, fingerprint);
+  const enrichmentKey = `${anchorPath}\0${fingerprint}`;
+  if (state.explorationTelemetry.enrichedReadTargets.has(enrichmentKey)) {
+    const note = "[Sydes note: this unchanged file was previously inspected; structural context is unchanged.]";
+    const result = base({
+      skippedReason: "already_enriched",
+      repeatedReadUnchanged,
+      repeatedReadAfterModification,
+      repeatedEnrichmentAvoided: true,
+      enrichmentBytes: repeatedReadUnchanged ? Buffer.byteLength(note, "utf8") : 0
+    });
+    return repeatedReadUnchanged ? { ...result, footer: note } : result;
   }
-  state.explorationTelemetry.enrichedReadTargets.add(anchorPath);
+  state.explorationTelemetry.enrichedReadTargets.add(enrichmentKey);
 
   let cbmQueryCount = 0;
   try {
@@ -434,7 +464,9 @@ async function maybeBuildReadEnrichment(
     if (!resolution.project?.name) {
       return base({
         cbmElapsedMs: Math.max(0, now() - startedAt),
-        failureReason: resolution.reason ?? "project_unresolved"
+        failureReason: resolution.reason ?? "project_unresolved",
+        repeatedReadUnchanged,
+        repeatedReadAfterModification
       });
     }
 
@@ -458,19 +490,19 @@ async function maybeBuildReadEnrichment(
       relationships.push(...traced.relationships);
     }
 
-    const footer = renderStructuralFooter(anchorPath, symbols, relatedSymbols, relationships);
-    const filesSuggested = uniqueStrings(relatedSymbols.map((symbol) => symbol.filePath).filter(isDefined))
-      .filter((path) => path !== anchorPath && !isTestPath(path))
-      .slice(0, 6);
-    const testsSuggested = uniqueStrings(relatedSymbols.map((symbol) => symbol.filePath).filter(isDefined))
-      .filter(isTestPath)
-      .slice(0, 4);
+    const suggestions = buildNavigationSuggestions(anchorPath, symbols, relatedSymbols, state);
+    for (const path of [anchorPath, ...suggestions.relatedCodeFilesSuggested, ...suggestions.relatedTestFilesSuggested]) {
+      state.explorationTelemetry.surfacedGraphFiles.add(path);
+    }
+    const footer = renderStructuralFooter(anchorPath, symbols, suggestions, relationships, repeatedReadAfterModification);
 
     if (!footer) {
       return base({
         cbmQueryCount,
         cbmElapsedMs: Math.max(0, now() - startedAt),
-        skippedReason: "no_structural_context"
+        skippedReason: "no_structural_context",
+        repeatedReadUnchanged,
+        repeatedReadAfterModification
       });
     }
 
@@ -483,8 +515,114 @@ async function maybeBuildReadEnrichment(
         generated: true,
         enrichmentBytes: Buffer.byteLength(footer, "utf8"),
         relationshipsReturned: relationships.length,
-        filesSuggested,
-        testsSuggested
+        filesSuggested: suggestions.relatedCodeFilesSuggested,
+        testsSuggested: suggestions.relatedTestFilesSuggested,
+        resolvedRelatedSymbols: suggestions.resolvedRelatedSymbols,
+        relatedCodeFilesSuggested: suggestions.relatedCodeFilesSuggested,
+        relatedTestFilesSuggested: suggestions.relatedTestFilesSuggested,
+        repeatedReadUnchanged,
+        repeatedReadAfterModification,
+        repeatedEnrichmentAvoided: false
+      }
+    };
+  } catch (error) {
+    return base({
+      cbmQueryCount,
+      cbmElapsedMs: Math.max(0, now() - startedAt),
+      failureReason: error instanceof Error ? error.message : String(error),
+      repeatedReadUnchanged,
+      repeatedReadAfterModification
+    });
+  }
+}
+
+async function maybeBuildFailedReadRecovery(
+  event: ToolResultEvent,
+  repoPath: string,
+  state: SydesRuntimeState,
+  cbm: PolicyCbmClient,
+  requestedPath: string | undefined,
+  now: () => number = Date.now
+): Promise<ReadEnrichmentResult> {
+  const startedAt = now();
+  const base = (overrides: Partial<NonNullable<ExplorationToolEvent["enrichment"]>>): ReadEnrichmentResult => ({
+    telemetry: {
+      anchorPath: requestedPath,
+      cbmQueryCount: 0,
+      cbmElapsedMs: Math.max(0, now() - startedAt),
+      generated: false,
+      enrichmentBytes: 0,
+      relationshipsReturned: 0,
+      filesSuggested: [],
+      testsSuggested: [],
+      failedReadRecoveryGenerated: false,
+      failedReadRecoveryCandidates: [],
+      ...overrides
+    }
+  });
+
+  if (!requestedPath) {
+    return base({ skippedReason: "no_anchor_path" });
+  }
+
+  let cbmQueryCount = 0;
+  try {
+    const knownCandidates = rankRecoveryCandidates(
+      requestedPath,
+      [...state.explorationTelemetry.surfacedGraphFiles],
+      true
+    );
+    let graphCandidates: string[] = [];
+    const query = recoveryQueryForPath(requestedPath);
+    if (query) {
+      const resolution = await ensureProjectForRepo(repoPath, cbm, {
+        allowIndex: true,
+        cache: state.projectCache
+      });
+      if (resolution.project?.name) {
+        cbmQueryCount += 1;
+        const result = await cbm.searchGraphByArgs({
+          project: resolution.project.name,
+          query,
+          limit: 20
+        });
+        graphCandidates = rowsFromCbmResult(result)
+          .map((row) => stringValue(row.file) ?? stringValue(row.filePath))
+          .filter(isDefined);
+      }
+    }
+
+    const candidates = rankRecoveryCandidates(requestedPath, [...knownCandidates, ...graphCandidates], false).slice(0, 3);
+    if (candidates.length === 0) {
+      return base({
+        cbmQueryCount,
+        cbmElapsedMs: Math.max(0, now() - startedAt),
+        skippedReason: "no_recovery_candidates"
+      });
+    }
+
+    const footer = boundFooter([
+      SYDES_PATH_RECOVERY_HEADER,
+      "Requested path does not exist.",
+      "",
+      "Existing nearby candidates:",
+      ...candidates.map((candidate) => `- ${candidate}`)
+    ].join("\n"));
+    return {
+      footer,
+      telemetry: {
+        anchorPath: requestedPath,
+        cbmQueryCount,
+        cbmElapsedMs: Math.max(0, now() - startedAt),
+        generated: true,
+        enrichmentBytes: Buffer.byteLength(footer, "utf8"),
+        relationshipsReturned: 0,
+        filesSuggested: candidates.filter((path) => !isTestPath(path)),
+        testsSuggested: candidates.filter(isTestPath),
+        failedReadRecoveryGenerated: true,
+        failedReadRecoveryCandidates: candidates,
+        relatedCodeFilesSuggested: candidates.filter((path) => !isTestPath(path)),
+        relatedTestFilesSuggested: candidates.filter(isTestPath)
       }
     };
   } catch (error) {
@@ -499,33 +637,77 @@ async function maybeBuildReadEnrichment(
 function renderStructuralFooter(
   anchorPath: string,
   symbols: StructuralSymbol[],
-  relatedSymbols: StructuralSymbol[],
-  relationships: StructuralRelationship[]
+  suggestions: NavigationSuggestions,
+  relationships: StructuralRelationship[],
+  repeatedAfterModification = false
 ): string | undefined {
-  const sameFileSymbols = uniqueStrings(symbols.map((symbol) => displaySymbol(symbol))).slice(0, 6);
-  const related = uniqueStrings(relatedSymbols.map((symbol) => displaySymbol(symbol))).filter((name) => !sameFileSymbols.includes(name)).slice(0, 6);
-  const files = uniqueStrings(relatedSymbols.map((symbol) => symbol.filePath).filter(isDefined))
-    .filter((path) => path !== anchorPath && !isTestPath(path))
-    .slice(0, 6);
-  const tests = uniqueStrings(relatedSymbols.map((symbol) => symbol.filePath).filter(isDefined))
-    .filter(isTestPath)
-    .slice(0, 4);
-
-  if (sameFileSymbols.length === 0 && related.length === 0 && files.length === 0 && tests.length === 0) {
+  if (
+    suggestions.sameFileSymbols.length === 0 &&
+    suggestions.resolvedRelatedSymbols.length === 0 &&
+    suggestions.relatedCodeFilesSuggested.length === 0 &&
+    suggestions.relatedTestFilesSuggested.length === 0
+  ) {
     return undefined;
   }
 
   const lines = [
     SYDES_STRUCTURAL_CONTEXT_HEADER,
-    `Anchor file: ${anchorPath}`,
-    formatFooterList("Symbols in this file", sameFileSymbols),
-    formatFooterList("Related symbols", related),
-    formatFooterList("Connected files", files),
-    formatFooterList("Related tests", tests),
+    `Anchor: ${anchorPath}`,
+    repeatedAfterModification ? "File changed since previous read; structural context refreshed." : undefined,
+    formatFooterList("Symbols in this file", suggestions.sameFileSymbols),
+    formatFooterList("Related code", suggestions.resolvedRelatedSymbols.map((symbol) => `${symbol.name} - ${symbol.filePath}`)),
+    formatFooterList("Next code files", suggestions.relatedCodeFilesSuggested),
+    formatFooterList("Related tests", suggestions.relatedTestFilesSuggested),
     relationships.length ? `Relationships returned: ${relationships.length}` : undefined,
     "Verify graph hints against source before editing."
   ].filter(isDefined);
   return boundFooter(lines.join("\n"));
+}
+
+function buildNavigationSuggestions(
+  anchorPath: string,
+  symbols: StructuralSymbol[],
+  relatedSymbols: StructuralSymbol[],
+  state: SydesRuntimeState
+): NavigationSuggestions {
+  const alreadyRead = new Set(state.explorationTelemetry.readFileFingerprints.keys());
+  const sameFileSymbols = uniqueStrings(symbols.map((symbol) => symbol.name)).slice(0, 4);
+  const resolvedRelatedSymbols = uniqueResolvedSymbols(
+    relatedSymbols
+      .filter((symbol) => symbol.filePath && symbol.filePath !== anchorPath)
+      .map((symbol) => ({
+        name: symbol.name,
+        kind: symbol.kind,
+        filePath: symbol.filePath as string
+      }))
+  ).slice(0, 8);
+  const relatedCodeFilesSuggested = rankSuggestedFiles(
+    resolvedRelatedSymbols.map((symbol) => symbol.filePath),
+    anchorPath,
+    alreadyRead,
+    false
+  ).slice(0, 3);
+  const relatedTestFilesSuggested = rankSuggestedFiles(
+    resolvedRelatedSymbols.map((symbol) => symbol.filePath),
+    anchorPath,
+    alreadyRead,
+    true
+  ).slice(0, 2);
+  return {
+    sameFileSymbols,
+    resolvedRelatedSymbols,
+    relatedCodeFilesSuggested,
+    relatedTestFilesSuggested
+  };
+}
+
+function rankSuggestedFiles(paths: string[], anchorPath: string, alreadyRead: Set<string>, testsOnly: boolean): string[] {
+  return uniqueStrings(paths)
+    .filter((path) => path !== anchorPath)
+    .filter((path) => isTestPath(path) === testsOnly)
+    .filter((path) => !isGenericPath(path))
+    .sort((a, b) => Number(alreadyRead.has(a)) - Number(alreadyRead.has(b)) || a.localeCompare(b))
+    .filter((path) => !alreadyRead.has(path));
 }
 
 function formatFooterList(label: string, values: string[]): string | undefined {
@@ -548,6 +730,70 @@ function boundFooter(text: string): string {
     lines.push(line);
   }
   return [...lines, "..."].join("\n");
+}
+
+function fingerprintReadContent(content: ToolResultEvent["content"]): string {
+  return createHash("sha256").update(JSON.stringify(content)).digest("hex");
+}
+
+function recoveryQueryForPath(requestedPath: string): string | undefined {
+  const basename = pathPosix.basename(requestedPath);
+  const stem = basename.replace(/\.[^.]+$/, "");
+  return stem.length >= 3 ? stem : basename.length >= 3 ? basename : undefined;
+}
+
+function rankRecoveryCandidates(requestedPath: string, candidates: string[], allowPreviouslySurfaced: boolean): string[] {
+  const ranked = uniqueStrings(candidates)
+    .map((candidate) => ({
+      candidate,
+      score: recoveryScore(requestedPath, candidate, allowPreviouslySurfaced)
+    }))
+    .filter((item) => item.score >= 3)
+    .sort((a, b) => b.score - a.score || a.candidate.localeCompare(b.candidate))
+    .map((item) => item.candidate);
+  return ranked;
+}
+
+function recoveryScore(requestedPath: string, candidate: string, allowPreviouslySurfaced: boolean): number {
+  if (!candidate || candidate === requestedPath) {
+    return 0;
+  }
+  const requestedSegments = pathSegments(requestedPath);
+  const candidateSegments = pathSegments(candidate);
+  const requestedBase = requestedSegments[requestedSegments.length - 1] ?? "";
+  const candidateBase = candidateSegments[candidateSegments.length - 1] ?? "";
+  let score = 0;
+  if (requestedBase === candidateBase) {
+    score += 5;
+  } else if (stripExtension(requestedBase) === stripExtension(candidateBase)) {
+    score += 4;
+  } else if (stripExtension(candidateBase).includes(stripExtension(requestedBase)) || stripExtension(requestedBase).includes(stripExtension(candidateBase))) {
+    score += 2;
+  } else if (sharedPrefixLength(stripExtension(requestedBase), stripExtension(candidateBase)) >= 4) {
+    score += 2;
+  }
+  const sharedSegments = requestedSegments.filter((segment) => candidateSegments.includes(segment) && !GENERIC_PATH_SEGMENTS.has(segment)).length;
+  score += Math.min(sharedSegments, 3);
+  if (allowPreviouslySurfaced) {
+    score += 1;
+  }
+  return score;
+}
+
+function sharedPrefixLength(left: string, right: string): number {
+  let index = 0;
+  while (index < left.length && index < right.length && left[index] === right[index]) {
+    index += 1;
+  }
+  return index;
+}
+
+function pathSegments(path: string): string[] {
+  return path.split("/").map((segment) => stripExtension(segment.toLowerCase())).filter(Boolean);
+}
+
+function stripExtension(value: string): string {
+  return value.replace(/\.[^.]+$/, "").toLowerCase();
 }
 
 function rowsFromCbmResult(result: { parsed?: unknown } | unknown): Record<string, unknown>[] {
@@ -660,6 +906,25 @@ function stringValue(value: unknown): string | undefined {
 
 function isTestPath(path: string): boolean {
   return /(^|\/)(test|tests|spec|__tests__)(\/|$)|(_test|\.test|\.spec)\.[^.]+$/i.test(path);
+}
+
+const GENERIC_PATH_SEGMENTS = new Set(["cmd", "config", "configs", "main", "server", "app", "internal", "pkg", "src", "lib"]);
+
+function isGenericPath(path: string): boolean {
+  const stem = stripExtension(pathPosix.basename(path));
+  return GENERIC_PATH_SEGMENTS.has(stem);
+}
+
+function uniqueResolvedSymbols(symbols: Array<{ name: string; filePath: string; kind?: string }>): Array<{ name: string; filePath: string; kind?: string }> {
+  const seen = new Set<string>();
+  return symbols.filter((symbol) => {
+    const key = `${symbol.name}\0${symbol.filePath}`;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
 }
 
 function uniqueSymbols(symbols: Array<StructuralSymbol | undefined>): StructuralSymbol[] {

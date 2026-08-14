@@ -9,6 +9,7 @@ import {
   handleToolMiddlewareToolResult,
   recordExplorationToolResult,
   shouldInjectForPrompt,
+  SYDES_PATH_RECOVERY_HEADER,
   SYDES_STRUCTURAL_CONTEXT_HEADER,
   type SydesRuntimeState
 } from "../src/extension.js";
@@ -92,11 +93,20 @@ function makeStructuralReadClient(overrides: Partial<PolicyCbmClient> = {}): Pol
         direction: "both",
         callers: {
           cols: ["qn", "label", "file", "lines"],
-          rows: [[`${projectName}.pkg.handler.TestAddPokemon`, "Test", "pkg/handler/pokedex_test.go", "10-20"]]
+          rows: [
+            [`${projectName}.pkg.handler.TestAddPokemon`, "Test", "pkg/handler/pokedex_test.go", "10-20"],
+            [`${projectName}.pkg.handler.TestAddPokemonZeroHp`, "Test", "pkg/handler/pokedex_zero_test.go", "22-35"],
+            [`${projectName}.pkg.handler.TestAddPokemonValidation`, "Test", "pkg/handler/pokedex_validation_test.go", "40-55"]
+          ]
         },
         callees: {
           cols: ["qn", "label", "file", "lines"],
-          rows: [[`${projectName}.pkg.service.AddPokemon`, "Method", "pkg/service/pokemon.go", "16-18"]]
+          rows: [
+            [`${projectName}.pkg.service.AddPokemon`, "Method", "pkg/service/pokemon.go", "16-18"],
+            [`${projectName}.pkg.repository.AddPokemon`, "Method", "pkg/repository/pokedex_postgres.go", "19-36"],
+            [`${projectName}.pkg.handler.RespondWithError`, "Function", "pkg/handler/response.go", "5-12"],
+            [`${projectName}.pkg.handler.DecodePokemonJSON`, "Function", "pkg/handler/json.go", "7-20"]
+          ]
         }
       })
     ),
@@ -546,7 +556,7 @@ describe("Phase 1 exploration policy", () => {
       type: "text",
       text: expect.stringContaining(SYDES_STRUCTURAL_CONTEXT_HEADER)
     });
-    expect(JSON.stringify(result?.content)).toContain("Anchor file: pkg/handler/pokedex.go");
+    expect(JSON.stringify(result?.content)).toContain("Anchor: pkg/handler/pokedex.go");
     expect(JSON.stringify(result?.content)).toContain("AddPokemon");
     expect(JSON.stringify(result?.content)).toContain("pkg/service/pokemon.go");
     expect(JSON.stringify(result?.content)).toContain("pkg/handler/pokedex_test.go");
@@ -564,12 +574,87 @@ describe("Phase 1 exploration policy", () => {
           anchorPath: "pkg/handler/pokedex.go",
           cbmQueryCount: 3,
           generated: true,
-          relationshipsReturned: 4,
-          filesSuggested: ["pkg/service/pokemon.go"],
-          testsSuggested: ["pkg/handler/pokedex_test.go"]
+          relationshipsReturned: 14,
+          filesSuggested: ["pkg/handler/json.go", "pkg/handler/response.go", "pkg/repository/pokedex_postgres.go"],
+          testsSuggested: ["pkg/handler/pokedex_test.go", "pkg/handler/pokedex_validation_test.go"],
+          relatedCodeFilesSuggested: ["pkg/handler/json.go", "pkg/handler/response.go", "pkg/repository/pokedex_postgres.go"],
+          relatedTestFilesSuggested: ["pkg/handler/pokedex_test.go", "pkg/handler/pokedex_validation_test.go"]
         })
       })
     );
+  });
+
+  it("resolves related symbols to exact file paths and omits unresolved paths", async () => {
+    const state = makeState();
+    const client = makeStructuralReadClient({
+      tracePath: vi.fn(async () =>
+        envelope({
+          callers: { cols: ["qn", "label"], rows: [[`${projectName}.pkg.handler.UnknownCaller`, "Function"]] },
+          callees: {
+            cols: ["qn", "label", "file"],
+            rows: [[`${projectName}.pkg.handler.RespondWithError`, "Function", "pkg/handler/response.go"]]
+          }
+        })
+      )
+    });
+    const result = await handleToolMiddlewareToolResult({
+      type: "tool_result",
+      toolName: "read",
+      toolCallId: "read-1",
+      input: { path: "/tmp/pokemon-api/pkg/handler/pokedex.go" },
+      content: [{ type: "text", text: "package handler" }],
+      details: undefined,
+      isError: false
+    } as never, repoPath, state, client);
+
+    const text = JSON.stringify(result?.content);
+    expect(text).toContain("RespondWithError - pkg/handler/response.go");
+    expect(text).not.toContain("UnknownCaller");
+  });
+
+  it("caps related code suggestions at 3 and test suggestions at 2", async () => {
+    const state = makeState();
+    const client = makeStructuralReadClient();
+    await handleToolMiddlewareToolResult({
+      type: "tool_result",
+      toolName: "read",
+      toolCallId: "read-1",
+      input: { path: "/tmp/pokemon-api/pkg/handler/pokedex.go" },
+      content: [{ type: "text", text: "package handler" }],
+      details: undefined,
+      isError: false
+    } as never, repoPath, state, client);
+
+    expect(state.telemetry?.recordExplorationToolEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        enrichment: expect.objectContaining({
+          relatedCodeFilesSuggested: expect.arrayContaining(["pkg/handler/json.go", "pkg/handler/response.go", "pkg/repository/pokedex_postgres.go"]),
+          relatedTestFilesSuggested: ["pkg/handler/pokedex_test.go", "pkg/handler/pokedex_validation_test.go"]
+        })
+      })
+    );
+    const event = vi.mocked(state.telemetry!.recordExplorationToolEvent!).mock.calls[0][0];
+    expect(event.enrichment?.relatedCodeFilesSuggested).toHaveLength(3);
+    expect(event.enrichment?.relatedTestFilesSuggested).toHaveLength(2);
+  });
+
+  it("omits the anchor and already-read files from next-file suggestions", async () => {
+    const state = makeState();
+    state.explorationTelemetry.readFileFingerprints.set("pkg/handler/json.go", "seen");
+    const client = makeStructuralReadClient();
+    await handleToolMiddlewareToolResult({
+      type: "tool_result",
+      toolName: "read",
+      toolCallId: "read-1",
+      input: { path: "/tmp/pokemon-api/pkg/handler/pokedex.go" },
+      content: [{ type: "text", text: "package handler" }],
+      details: undefined,
+      isError: false
+    } as never, repoPath, state, client);
+
+    const event = vi.mocked(state.telemetry!.recordExplorationToolEvent!).mock.calls[0][0];
+    expect(event.enrichment?.relatedCodeFilesSuggested).not.toContain("pkg/handler/pokedex.go");
+    expect(event.enrichment?.relatedCodeFilesSuggested).not.toContain("pkg/handler/json.go");
   });
 
   it("uses the concrete read file as the graph anchor, not task prose", async () => {
@@ -608,7 +693,10 @@ describe("Phase 1 exploration policy", () => {
     const second = await handleToolMiddlewareToolResult({ ...event, toolCallId: "read-2" } as ToolResultEvent, repoPath, state, client, () => 1200);
 
     expect(first?.content?.length).toBe(2);
-    expect(second).toBeUndefined();
+    expect(second?.content?.[1]).toMatchObject({
+      type: "text",
+      text: expect.stringContaining("unchanged file was previously inspected")
+    });
     expect(client.searchGraphByArgs).toHaveBeenCalledTimes(1);
     expect(client.tracePath).toHaveBeenCalledTimes(2);
     expect(state.telemetry?.recordExplorationToolEvent).toHaveBeenLastCalledWith(
@@ -616,7 +704,44 @@ describe("Phase 1 exploration policy", () => {
         repeated: true,
         enrichment: expect.objectContaining({
           generated: false,
-          skippedReason: "already_enriched"
+          skippedReason: "already_enriched",
+          repeatedReadUnchanged: true,
+          repeatedEnrichmentAvoided: true
+        })
+      })
+    );
+  });
+
+  it("treats a modified repeated read as fresh structural context", async () => {
+    const state = makeState();
+    const client = makeStructuralReadClient();
+    const baseEvent = {
+      type: "tool_result",
+      toolName: "read",
+      toolCallId: "read-1",
+      input: { path: "/tmp/pokemon-api/pkg/handler/pokedex.go" },
+      content: [{ type: "text", text: "package handler" }],
+      details: undefined,
+      isError: false
+    } as ToolResultEvent;
+
+    await handleToolMiddlewareToolResult(baseEvent, repoPath, state, client);
+    const modified = await handleToolMiddlewareToolResult({
+      ...baseEvent,
+      toolCallId: "read-2",
+      content: [{ type: "text", text: "package handler\nfunc changed() {}" }]
+    } as ToolResultEvent, repoPath, state, client);
+
+    expect(modified?.content?.[1]).toMatchObject({
+      type: "text",
+      text: expect.stringContaining("structural context refreshed")
+    });
+    expect(client.searchGraphByArgs).toHaveBeenCalledTimes(2);
+    expect(state.telemetry?.recordExplorationToolEvent).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        enrichment: expect.objectContaining({
+          generated: true,
+          repeatedReadAfterModification: true
         })
       })
     );
@@ -644,6 +769,102 @@ describe("Phase 1 exploration policy", () => {
         })
       })
     );
+  });
+
+  it("appends failed-read recovery when a strong existing candidate exists", async () => {
+    const state = makeState();
+    const originalContent = [{ type: "text", text: "read: no such file or directory" }];
+    const client = makeStructuralReadClient({
+      searchGraphByArgs: vi.fn(async (args) => {
+        if (args.query === "pokemon") {
+          return envelope({
+            cols: ["qn", "label", "file"],
+            rows: [
+              [`${projectName}.pkg.handler.addPokemon`, "Method", "pkg/handler/pokemon.go"],
+              [`${projectName}.pkg.handler.InitRoutes`, "Function", "pkg/handler/handler.go"],
+              [`${projectName}.pkg.repository.AddPokemon`, "Method", "pkg/repository/pokemon.go"],
+              [`${projectName}.cmd.main`, "Function", "cmd/main.go"]
+            ]
+          });
+        }
+        return envelope({ cols: ["qn", "label", "file"], rows: [] });
+      })
+    });
+    const result = await handleToolMiddlewareToolResult({
+      type: "tool_result",
+      toolName: "read",
+      toolCallId: "read-missing",
+      input: { path: "server/handler/pokemon.go" },
+      content: originalContent,
+      details: undefined,
+      isError: true
+    } as never, repoPath, state, client);
+
+    expect(result?.content?.[0]).toBe(originalContent[0]);
+    expect(result?.content?.[1]).toMatchObject({
+      type: "text",
+      text: expect.stringContaining(SYDES_PATH_RECOVERY_HEADER)
+    });
+    expect(JSON.stringify(result?.content)).toContain("pkg/handler/pokemon.go");
+    expect(JSON.stringify(result?.content)).not.toContain("cmd/main.go");
+    expect(state.telemetry?.recordExplorationToolEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        enrichment: expect.objectContaining({
+          failedReadRecoveryGenerated: true,
+          failedReadRecoveryCandidates: ["pkg/handler/pokemon.go", "pkg/repository/pokemon.go"]
+        })
+      })
+    );
+  });
+
+  it("leaves failed read unchanged when recovery confidence is weak", async () => {
+    const state = makeState();
+    const client = makeStructuralReadClient({
+      searchGraphByArgs: vi.fn(async () =>
+        envelope({
+          cols: ["qn", "label", "file"],
+          rows: [[`${projectName}.pkg.health.Health`, "Function", "pkg/health/check.go"]]
+        })
+      )
+    });
+    const result = await handleToolMiddlewareToolResult({
+      type: "tool_result",
+      toolName: "read",
+      toolCallId: "read-missing",
+      input: { path: "server/handler/pokemon.go" },
+      content: [{ type: "text", text: "read: no such file or directory" }],
+      details: undefined,
+      isError: true
+    } as never, repoPath, state, client);
+
+    expect(result).toBeUndefined();
+    expect(state.telemetry?.recordExplorationToolEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        enrichment: expect.objectContaining({
+          failedReadRecoveryGenerated: false,
+          skippedReason: "no_recovery_candidates"
+        })
+      })
+    );
+  });
+
+  it("uses graph-known files as failed-read recovery candidates", async () => {
+    const state = makeState();
+    state.explorationTelemetry.surfacedGraphFiles.add("pkg/handler/pokedex.go");
+    const client = makeStructuralReadClient({
+      searchGraphByArgs: vi.fn(async () => envelope({ cols: ["qn", "label", "file"], rows: [] }))
+    });
+    const result = await handleToolMiddlewareToolResult({
+      type: "tool_result",
+      toolName: "read",
+      toolCallId: "read-missing",
+      input: { path: "server/handler/pokemon.go" },
+      content: [{ type: "text", text: "read: no such file or directory" }],
+      details: undefined,
+      isError: true
+    } as never, repoPath, state, client);
+
+    expect(JSON.stringify(result?.content)).toContain("pkg/handler/pokedex.go");
   });
 
   it("keeps grep and find passive without querying CBM", async () => {
@@ -728,7 +949,9 @@ function makeState(): SydesRuntimeState {
       sequence: 0,
       startedAt: 1000,
       seenTargets: new Set<string>(),
-      enrichedReadTargets: new Set<string>()
+      enrichedReadTargets: new Set<string>(),
+      readFileFingerprints: new Map<string, string>(),
+      surfacedGraphFiles: new Set<string>()
     },
     telemetry: {
       recordExplorationToolEvent: vi.fn(async () => undefined)

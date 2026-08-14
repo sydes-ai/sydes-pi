@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { posix as pathPosix } from "node:path";
+import { readFile } from "node:fs/promises";
+import { posix as pathPosix, resolve } from "node:path";
 import type {
   BeforeAgentStartEvent,
   BeforeAgentStartEventResult,
@@ -436,7 +437,10 @@ async function maybeBuildReadEnrichment(
   if (!anchorPath) {
     return base({ skippedReason: "no_anchor_path" });
   }
-  const fingerprint = fingerprintReadContent(event.content);
+  const fingerprint = await fingerprintRepositoryFile(repoPath, anchorPath);
+  if (!fingerprint) {
+    return base({ failureReason: "file_fingerprint_unavailable" });
+  }
   const previousFingerprint = state.explorationTelemetry.readFileFingerprints.get(anchorPath);
   const repeatedReadUnchanged = previousFingerprint === fingerprint;
   const repeatedReadAfterModification = !!previousFingerprint && previousFingerprint !== fingerprint;
@@ -476,7 +480,7 @@ async function maybeBuildReadEnrichment(
       query: anchorPath,
       limit: 12
     });
-    const symbols = uniqueSymbols(rowsFromCbmResult(graph).map((row) => symbolFromRow(row))).filter(
+    const symbols = uniqueSymbols(rowsFromCbmResult(graph).map((row) => symbolFromRow(row, repoPath))).filter(
       (symbol): symbol is StructuralSymbol => !!symbol && symbol.filePath === anchorPath
     );
 
@@ -485,16 +489,27 @@ async function maybeBuildReadEnrichment(
     for (const symbol of symbols.slice(0, 2)) {
       cbmQueryCount += 1;
       const trace = await cbm.tracePath(resolution.project.name, symbol.qualifiedName);
-      const traced = parseTraceSymbols(trace, symbol.qualifiedName);
+      const traced = parseTraceSymbols(trace, repoPath, symbol.qualifiedName);
       relatedSymbols.push(...traced.symbols);
       relationships.push(...traced.relationships);
     }
+    const uniqueRelated = uniqueSymbols(relatedSymbols);
+    const resolutionResult = await resolveMissingSymbolPaths(
+      resolution.project.name,
+      repoPath,
+      cbm,
+      uniqueRelated,
+      10
+    );
+    cbmQueryCount += resolutionResult.queryCount;
 
-    const suggestions = buildNavigationSuggestions(anchorPath, symbols, relatedSymbols, state);
+    const uniqueRelationList = uniqueRelationships(relationships);
+    const relationshipsReturned = uniqueRelationList.length;
+    const suggestions = buildNavigationSuggestions(anchorPath, symbols, resolutionResult.symbols, state);
     for (const path of [anchorPath, ...suggestions.relatedCodeFilesSuggested, ...suggestions.relatedTestFilesSuggested]) {
       state.explorationTelemetry.surfacedGraphFiles.add(path);
     }
-    const footer = renderStructuralFooter(anchorPath, symbols, suggestions, relationships, repeatedReadAfterModification);
+    const footer = renderStructuralFooter(anchorPath, symbols, suggestions, uniqueRelationList, repeatedReadAfterModification);
 
     if (!footer) {
       return base({
@@ -514,7 +529,7 @@ async function maybeBuildReadEnrichment(
         cbmElapsedMs: Math.max(0, now() - startedAt),
         generated: true,
         enrichmentBytes: Buffer.byteLength(footer, "utf8"),
-        relationshipsReturned: relationships.length,
+        relationshipsReturned,
         filesSuggested: suggestions.relatedCodeFilesSuggested,
         testsSuggested: suggestions.relatedTestFilesSuggested,
         resolvedRelatedSymbols: suggestions.resolvedRelatedSymbols,
@@ -587,7 +602,7 @@ async function maybeBuildFailedReadRecovery(
           limit: 20
         });
         graphCandidates = rowsFromCbmResult(result)
-          .map((row) => stringValue(row.file) ?? stringValue(row.filePath))
+          .map((row) => sourcePathFromRow(row, repoPath))
           .filter(isDefined);
       }
     }
@@ -710,6 +725,68 @@ function rankSuggestedFiles(paths: string[], anchorPath: string, alreadyRead: Se
     .filter((path) => !alreadyRead.has(path));
 }
 
+async function resolveMissingSymbolPaths(
+  project: string,
+  repoPath: string,
+  cbm: PolicyCbmClient,
+  symbols: StructuralSymbol[],
+  limit: number
+): Promise<{ symbols: StructuralSymbol[]; queryCount: number }> {
+  const resolved = [...symbols];
+  let queryCount = 0;
+  for (const symbol of resolved.filter((item) => !item.filePath).slice(0, limit)) {
+    const query = fileResolutionQuery(symbol.qualifiedName);
+    if (!query) {
+      continue;
+    }
+    queryCount += 1;
+    const result = await cbm.searchGraphByArgs({
+      project,
+      query,
+      limit: 8
+    });
+    const match = findSourcePathForSymbol(rowsFromCbmResult(result), repoPath, symbol);
+    if (match) {
+      symbol.filePath = match.filePath;
+      symbol.kind = symbol.kind ?? match.kind;
+    }
+  }
+  return { symbols: resolved, queryCount };
+}
+
+function findSourcePathForSymbol(
+  rows: Record<string, unknown>[],
+  repoPath: string,
+  symbol: StructuralSymbol
+): { filePath: string; kind?: string } | undefined {
+  const matches = rows
+    .map((row) => ({ row, parsed: symbolFromRow(row, repoPath) }))
+    .filter((entry): entry is { row: Record<string, unknown>; parsed: StructuralSymbol } => {
+      if (!entry.parsed?.filePath) {
+        return false;
+      }
+      return entry.parsed.qualifiedName === symbol.qualifiedName;
+    });
+  if (matches.length !== 1) {
+    return undefined;
+  }
+  return {
+    filePath: matches[0].parsed.filePath!,
+    kind: matches[0].parsed.kind
+  };
+}
+
+function fileResolutionQuery(qualifiedName: string): string {
+  if (!qualifiedName || qualifiedName === "undefined") {
+    return "";
+  }
+  const parts = qualifiedName.split(".");
+  const short = leafName(qualifiedName) ?? "";
+  const owner = parts.at(-2) && parts.at(-2) !== short ? parts.at(-2) : "";
+  const layer = parts.find((part) => /^(handler|service|repository|controller|route|helpers?)s?$/.test(part)) ?? "";
+  return uniqueStrings([owner, short, layer].filter(isDefined)).join(" ");
+}
+
 function formatFooterList(label: string, values: string[]): string | undefined {
   if (values.length === 0) {
     return undefined;
@@ -732,8 +809,13 @@ function boundFooter(text: string): string {
   return [...lines, "..."].join("\n");
 }
 
-function fingerprintReadContent(content: ToolResultEvent["content"]): string {
-  return createHash("sha256").update(JSON.stringify(content)).digest("hex");
+export async function fingerprintRepositoryFile(repoPath: string, normalizedPath: string): Promise<string | undefined> {
+  try {
+    const bytes = await readFile(resolve(repoPath, normalizedPath));
+    return createHash("sha256").update(bytes).digest("hex");
+  } catch {
+    return undefined;
+  }
 }
 
 function recoveryQueryForPath(requestedPath: string): string | undefined {
@@ -854,7 +936,7 @@ function rowsWithCols(cols: unknown[], rows: unknown[]): Record<string, unknown>
     );
 }
 
-function symbolFromRow(row: Record<string, unknown>): StructuralSymbol | undefined {
+function symbolFromRow(row: Record<string, unknown>, repoPath?: string): StructuralSymbol | undefined {
   const qualifiedName = stringValue(row.qn) ?? stringValue(row.qualifiedName) ?? joinedQualifiedName(row);
   const name = stringValue(row.name) ?? leafName(qualifiedName);
   if (!qualifiedName || !name) {
@@ -864,12 +946,12 @@ function symbolFromRow(row: Record<string, unknown>): StructuralSymbol | undefin
     name,
     qualifiedName,
     kind: stringValue(row.label) ?? stringValue(row.kind),
-    filePath: stringValue(row.file) ?? stringValue(row.filePath)
+    filePath: sourcePathFromRow(row, repoPath)
   };
 }
 
-function parseTraceSymbols(result: { parsed?: unknown } | unknown, sourceQualifiedName: string): { symbols: StructuralSymbol[]; relationships: StructuralRelationship[] } {
-  const symbols = uniqueSymbols(rowsFromCbmResult(result).map((row) => symbolFromRow(row))).filter(isDefined);
+function parseTraceSymbols(result: { parsed?: unknown } | unknown, repoPath: string, sourceQualifiedName: string): { symbols: StructuralSymbol[]; relationships: StructuralRelationship[] } {
+  const symbols = uniqueSymbols(rowsFromCbmResult(result).map((row) => symbolFromRow(row, repoPath))).filter(isDefined);
   return {
     symbols,
     relationships: symbols.map((symbol) => ({
@@ -878,6 +960,18 @@ function parseTraceSymbols(result: { parsed?: unknown } | unknown, sourceQualifi
       type: "related"
     }))
   };
+}
+
+function sourcePathFromRow(row: Record<string, unknown>, repoPath?: string): string | undefined {
+  const raw =
+    stringValue(row.file) ??
+    stringValue(row.filePath) ??
+    stringValue(row.file_path) ??
+    stringValue(row.path);
+  if (!raw) {
+    return undefined;
+  }
+  return repoPath ? normalizeImpactPath(repoPath, raw) : raw;
 }
 
 function joinedQualifiedName(row: Record<string, unknown>): string | undefined {
@@ -934,6 +1028,18 @@ function uniqueSymbols(symbols: Array<StructuralSymbol | undefined>): Structural
       return false;
     }
     const key = symbol.qualifiedName;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function uniqueRelationships(relationships: StructuralRelationship[]): StructuralRelationship[] {
+  const seen = new Set<string>();
+  return relationships.filter((relationship) => {
+    const key = `${relationship.from}\0${relationship.to}\0${relationship.type}`;
     if (seen.has(key)) {
       return false;
     }

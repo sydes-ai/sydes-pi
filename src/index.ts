@@ -13,6 +13,7 @@ export {
   createBeforeAgentStartHandler,
   createSydesExtension,
   default,
+  fingerprintRepositoryFile,
   handleToolMiddlewareToolResult,
   maybeSendImpactGuidance,
   observeMutationResult,

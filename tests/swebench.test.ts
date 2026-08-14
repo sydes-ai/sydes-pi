@@ -22,7 +22,7 @@ import {
   type SweDeps,
   type SweRunOptions
 } from "../src/benchmark/swebench.js";
-import { MODEL_CALL_MIN_INTERVAL_ENV, MODEL_CALL_PACING_EVENTS_ENV, MODEL_TPM_BUDGET_ENV } from "../src/benchmark/pi-request-pacer.js";
+import { MAX_PROVIDER_CALLS_ENV, MODEL_CALL_MIN_INTERVAL_ENV, MODEL_CALL_PACING_EVENTS_ENV, MODEL_TPM_BUDGET_ENV } from "../src/benchmark/pi-request-pacer.js";
 
 const tempRoots: string[] = [];
 
@@ -125,7 +125,8 @@ describe("SWE-bench runner", () => {
         SYDES_INTEGRATION_MODE: "graph-guidance",
         [MODEL_CALL_MIN_INTERVAL_ENV]: "12",
         [MODEL_TPM_BUDGET_ENV]: "34",
-        [MODEL_CALL_PACING_EVENTS_ENV]: "/tmp/old-events.jsonl"
+        [MODEL_CALL_PACING_EVENTS_ENV]: "/tmp/old-events.jsonl",
+        [MAX_PROVIDER_CALLS_ENV]: "56"
       }
     });
     const stockEnv = buildSwePiEnv({ ...options, mode: "stock" }, "/tmp/run/stock", "/tmp/run/stock/pi-sessions");
@@ -141,6 +142,8 @@ describe("SWE-bench runner", () => {
     expect(sydesEnv[MODEL_TPM_BUDGET_ENV]).toBe("180000");
     expect(stockEnv[MODEL_CALL_MIN_INTERVAL_ENV]).toBeUndefined();
     expect(sydesEnv[MODEL_CALL_MIN_INTERVAL_ENV]).toBeUndefined();
+    expect(stockEnv[MAX_PROVIDER_CALLS_ENV]).toBeUndefined();
+    expect(sydesEnv[MAX_PROVIDER_CALLS_ENV]).toBeUndefined();
     expect(stockEnv[MODEL_CALL_PACING_EVENTS_ENV]).toBe("/tmp/run/stock/provider-pacing-events.jsonl");
     expect(sydesEnv[MODEL_CALL_PACING_EVENTS_ENV]).toBe("/tmp/run/sydes/provider-pacing-events.jsonl");
   });
@@ -162,9 +165,13 @@ describe("SWE-bench runner", () => {
     const cli = parseSweArgs(["--instance", "apache__druid-13704", "--mode", "stock", "--model-tpm-budget", "180000"], { HOME: "/tmp/home" });
     const env = parseSweArgs(["--instance", "apache__druid-13704", "--mode", "stock"], { HOME: "/tmp/home", [MODEL_TPM_BUDGET_ENV]: "1234" });
     const fixed = parseSweArgs(["--instance", "apache__druid-13704", "--mode", "stock", "--model-call-min-interval-ms", "65000"], { HOME: "/tmp/home" });
+    const budgetCli = parseSweArgs(["--instance", "apache__druid-13704", "--mode", "stock", "--max-provider-calls", "30"], { HOME: "/tmp/home" });
+    const budgetEnv = parseSweArgs(["--instance", "apache__druid-13704", "--mode", "stock"], { HOME: "/tmp/home", [MAX_PROVIDER_CALLS_ENV]: "25" });
     expect(cli.modelTpmBudget).toBe(180000);
     expect(env.modelTpmBudget).toBe(1234);
     expect(fixed.modelCallMinIntervalMs).toBe(65000);
+    expect(budgetCli.maxProviderCalls).toBe(30);
+    expect(budgetEnv.maxProviderCalls).toBe(25);
   });
 
   it("uses identical TPM budget and pacer for stock and sydes", async () => {
@@ -187,6 +194,36 @@ describe("SWE-bench runner", () => {
     const stockEnv = buildSwePiEnv(options, "/tmp/run/stock", "/tmp/run/stock/pi-sessions");
     expect(stockEnv[MODEL_TPM_BUDGET_ENV]).toBe("180000");
     expect(stockEnv[MODEL_CALL_MIN_INTERVAL_ENV]).toBeUndefined();
+  });
+
+  it("loads the common benchmark extension in stock when only provider call budget is enabled", async () => {
+    const options = await makeOptions({ maxProviderCalls: 30 });
+    const manifest = normalizeSweRow(fixtureRow(), SWE_DATASET);
+    const stock = buildSwePiCommand({ ...options, mode: "stock" }, manifest, "/tmp/run/stock");
+    const stockEnv = buildSwePiEnv({ ...options, mode: "stock" }, "/tmp/run/stock", "/tmp/run/stock/pi-sessions");
+    expect(extensionValues(stock.args)).toEqual([SWE_REQUEST_PACER_EXTENSION_PATH]);
+    expect(stockEnv[MAX_PROVIDER_CALLS_ENV]).toBe("30");
+    expect(stockEnv[MODEL_TPM_BUDGET_ENV]).toBeUndefined();
+  });
+
+  it("applies identical provider call budget and TPM pacing to stock and sydes", async () => {
+    const options = await makeOptions({ modelTpmBudget: 180000, maxProviderCalls: 30, sydesIntegrationMode: "tool-middleware" });
+    const manifest = normalizeSweRow(fixtureRow(), SWE_DATASET);
+    const stock = buildSwePiCommand({ ...options, mode: "stock" }, manifest, "/tmp/run/stock");
+    const sydes = buildSwePiCommand({ ...options, mode: "sydes" }, manifest, "/tmp/run/sydes");
+    const stockEnv = buildSwePiEnv({ ...options, mode: "stock" }, "/tmp/run/stock", "/tmp/run/stock/pi-sessions");
+    const sydesEnv = buildSwePiEnv({ ...options, mode: "sydes" }, "/tmp/run/sydes", "/tmp/run/sydes/pi-sessions");
+
+    expect(extensionValues(stock.args)).toEqual([SWE_REQUEST_PACER_EXTENSION_PATH]);
+    expect(extensionValues(sydes.args)).toEqual([SWE_REQUEST_PACER_EXTENSION_PATH, options.extensionPath]);
+    expect(stockEnv[MAX_PROVIDER_CALLS_ENV]).toBe("30");
+    expect(sydesEnv[MAX_PROVIDER_CALLS_ENV]).toBe("30");
+    expect(stockEnv[MODEL_TPM_BUDGET_ENV]).toBe("180000");
+    expect(sydesEnv[MODEL_TPM_BUDGET_ENV]).toBe("180000");
+    expect(sydesEnv.SYDES_INTEGRATION_MODE).toBe("tool-middleware");
+    expect(stock.args.slice(0, 4)).toEqual(["--model", DEFAULT_MODEL, "--thinking", SWE_THINKING_LEVEL]);
+    expect(sydes.args.slice(0, 4)).toEqual(["--model", DEFAULT_MODEL, "--thinking", SWE_THINKING_LEVEL]);
+    expect(stock.prompt).toBe(sydes.prompt);
   });
 
   it("configures gpt-5-nano maxTokens in the benchmark-owned Pi models file", async () => {
@@ -303,6 +340,10 @@ describe("SWE-bench runner", () => {
         tpmBudget: 0,
         minIntervalMs: 0
       },
+      providerCallBudget: {
+        enabled: false,
+        maxCalls: 0
+      },
       finalDiffSha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     });
     expect(run.problemStatementSha256).toHaveLength(64);
@@ -325,8 +366,79 @@ describe("SWE-bench runner", () => {
         tpmBudget: 180000,
         windowMs: 60000,
         minIntervalMs: 0
+      },
+      providerCallBudget: {
+        enabled: false,
+        maxCalls: 0
       }
     });
+  });
+
+  it("records provider call budget exhaustion as a normal bounded termination and preserves partial diff", async () => {
+    const options = await makeOptions({ dryRun: false, confirmPaidRun: true, runId: "budget-stop", maxProviderCalls: 30 });
+    const deps = makeDeps(options, {
+      piExit: 1,
+      diff: "diff --git a/internal/configs/import.go b/internal/configs/import.go\n+partial fix\n",
+      providerEvents: [
+        ...Array.from({ length: 30 }, (_value, index) => JSON.stringify({ sequence: index + 1, waitedMs: 0 })),
+        JSON.stringify({
+          sequence: 31,
+          waitedMs: 0,
+          providerCallsStarted: 30,
+          providerCallBudgetMax: 30,
+          providerCallBudgetExhausted: true,
+          terminationReason: "provider_call_budget_exhausted"
+        })
+      ]
+    });
+
+    await expect(runSweBench(options, deps)).resolves.toBe(0);
+
+    const runDir = join(options.artifactsRoot, options.instanceId, "budget-stop", "stock");
+    const diff = await readFile(join(runDir, "final.diff"), "utf8");
+    const run = JSON.parse(await readFile(join(runDir, "run.json"), "utf8"));
+    expect(diff).toContain("+partial fix");
+    expect(run).toMatchObject({
+      terminationReason: "provider_call_budget_exhausted",
+      providerCallsStarted: 30,
+      providerCallBudgetExhausted: true,
+      piExitCode: 1,
+      providerCallBudget: {
+        enabled: true,
+        maxCalls: 30
+      }
+    });
+    expect(deps.analyze).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps natural completion before provider budget as completed", async () => {
+    const options = await makeOptions({ dryRun: false, confirmPaidRun: true, runId: "budget-complete", maxProviderCalls: 30 });
+    const deps = makeDeps(options, {
+      piExit: 0,
+      providerEvents: Array.from({ length: 12 }, (_value, index) => JSON.stringify({ sequence: index + 1, waitedMs: 0 }))
+    });
+
+    await expect(runSweBench(options, deps)).resolves.toBe(0);
+
+    const run = JSON.parse(await readFile(join(options.artifactsRoot, options.instanceId, "budget-complete", "stock", "run.json"), "utf8"));
+    expect(run).toMatchObject({
+      terminationReason: "completed",
+      providerCallsStarted: 12,
+      providerCallBudgetExhausted: false,
+      piExitCode: 0
+    });
+  });
+
+  it("does not classify non-budget Pi failures as normal termination", async () => {
+    const options = await makeOptions({ dryRun: false, confirmPaidRun: true, runId: "provider-failure", maxProviderCalls: 30 });
+    const deps = makeDeps(options, {
+      piExit: 1,
+      providerEvents: Array.from({ length: 3 }, (_value, index) => JSON.stringify({ sequence: index + 1, waitedMs: 0 }))
+    });
+
+    await expect(runSweBench(options, deps)).resolves.toBe(1);
+
+    await expect(readFile(join(options.artifactsRoot, options.instanceId, "provider-failure", "stock", "final.diff"), "utf8")).rejects.toThrow();
   });
 
   it("prints model, thinking, and max output tokens in dry-run output", async () => {
@@ -357,6 +469,20 @@ describe("SWE-bench runner", () => {
       log.mockRestore();
     }
     expect(lines).toContain("Provider request pacing: rolling TPM budget 180000/60s");
+  });
+
+  it("prints provider call budget in dry-run output", async () => {
+    const options = await makeOptions({ dryRun: true, runId: "dry-budget-output", maxProviderCalls: 30 });
+    const deps = makeDeps(options);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    let lines: string[] = [];
+    try {
+      await expect(runSweBench(options, deps)).resolves.toBe(0);
+      lines = log.mock.calls.map((call) => call.join(" "));
+    } finally {
+      log.mockRestore();
+    }
+    expect(lines).toContain("Provider call budget: 30 provider calls");
   });
 });
 
@@ -441,6 +567,7 @@ async function makeOptions(overrides: Partial<SweRunOptions> = {}): Promise<SweR
     sydesIntegrationMode: undefined,
     modelCallMinIntervalMs: 0,
     modelTpmBudget: 0,
+    maxProviderCalls: 0,
     ...overrides,
     env: { HOME: root, OPENAI_API_KEY: "set", ...(overrides.env ?? {}) }
   };
@@ -452,7 +579,7 @@ function extensionValues(args: string[]): string[] {
 
 function makeDeps(
   options: SweRunOptions,
-  behavior: { piExit?: number; diff?: string } = {}
+  behavior: { piExit?: number; diff?: string; providerEvents?: string[] } = {}
 ): SweDeps {
   let worktree = "";
   const cbm = {
@@ -488,6 +615,10 @@ function makeDeps(
       const sessionDir = args[args.indexOf("--session-dir") + 1];
       await mkdir(sessionDir, { recursive: true });
       await writeFile(join(sessionDir, "session.jsonl"), `${JSON.stringify({ message: { role: "assistant" } })}\n`);
+      const modeDir = sessionDir.replace(/\/pi-sessions$/, "");
+      if (behavior.providerEvents) {
+        await writeFile(join(modeDir, "provider-pacing-events.jsonl"), `${behavior.providerEvents.join("\n")}\n`);
+      }
       return behavior.piExit ?? 0;
     }),
     makeCbmClient: () => cbm as never,

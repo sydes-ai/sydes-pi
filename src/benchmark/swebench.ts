@@ -9,7 +9,7 @@ import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { CbmClient } from "../cbm/client.js";
 import type { SydesIntegrationMode } from "../config.js";
-import { MODEL_CALL_MIN_INTERVAL_ENV, MODEL_CALL_PACING_EVENTS_ENV, MODEL_TPM_BUDGET_ENV } from "./pi-request-pacer.js";
+import { MAX_PROVIDER_CALLS_ENV, MODEL_CALL_MIN_INTERVAL_ENV, MODEL_CALL_PACING_EVENTS_ENV, MODEL_TPM_BUDGET_ENV } from "./pi-request-pacer.js";
 import { buildRelevantContext, ensureProjectForRepo } from "../policy/exploration.js";
 import { analyzeSession } from "../telemetry/session-analyzer.js";
 
@@ -20,6 +20,7 @@ export const SWE_THINKING_LEVEL = "medium";
 export const SWE_MAX_OUTPUT_TOKENS = 16384;
 export const SWE_PI_AGENT_DIR = resolve("benchmarks/pi-agent");
 export const SWE_REQUEST_PACER_EXTENSION_PATH = resolve("src/benchmark/pi-request-pacer.ts");
+export const PROVIDER_CALL_BUDGET_EXHAUSTED = "provider_call_budget_exhausted";
 export type SweMode = "stock" | "sydes";
 
 export interface SweManifest {
@@ -55,6 +56,7 @@ export interface SweRunOptions {
   sydesIntegrationMode?: SydesIntegrationMode;
   modelCallMinIntervalMs: number;
   modelTpmBudget: number;
+  maxProviderCalls: number;
   env: NodeJS.ProcessEnv;
 }
 
@@ -88,6 +90,13 @@ export function parseSweArgs(argv: string[], env: NodeJS.ProcessEnv = process.en
         ?? env[MODEL_TPM_BUDGET_ENV]
         ?? "0",
       "--model-tpm-budget"
+    ),
+    maxProviderCalls: parseNonNegativeInt(
+      valueAfter(argv, "--max-provider-calls")
+        ?? valueWithPrefix(argv, "--max-provider-calls=")
+        ?? env[MAX_PROVIDER_CALLS_ENV]
+        ?? "0",
+      "--max-provider-calls"
     ),
     modelCallMinIntervalMs: parseNonNegativeInt(
       valueAfter(argv, "--model-call-min-interval-ms")
@@ -161,7 +170,7 @@ export function buildSwePiCommand(options: SweRunOptions, manifest: SweManifest,
   const sessionDir = join(runDir, "pi-sessions");
   const prompt = buildSweTaskPrompt(manifest.problem_statement);
   const args = ["--model", options.model, "--thinking", SWE_THINKING_LEVEL, "--mode", "text", "--print", "--no-extensions"];
-  if (requestPacingEnabled(options)) {
+  if (benchmarkProviderControlEnabled(options)) {
     args.push("--extension", options.requestPacerExtensionPath);
   }
   if (options.mode === "sydes") {
@@ -177,6 +186,7 @@ export function buildSwePiEnv(options: SweRunOptions, modeDir: string, sessionDi
     [MODEL_CALL_MIN_INTERVAL_ENV]: _discardedMinInterval,
     [MODEL_TPM_BUDGET_ENV]: _discardedTpmBudget,
     [MODEL_CALL_PACING_EVENTS_ENV]: _discardedEvents,
+    [MAX_PROVIDER_CALLS_ENV]: _discardedMaxProviderCalls,
     ...baseEnv
   } = options.env;
   const sydesIntegrationMode = options.sydesIntegrationMode ?? options.env.SYDES_INTEGRATION_MODE;
@@ -186,9 +196,10 @@ export function buildSwePiEnv(options: SweRunOptions, modeDir: string, sessionDi
     SYDES_RUN_DIR: options.mode === "sydes" ? modeDir : "",
     PI_CODING_AGENT_SESSION_DIR: sessionDir,
     ...(options.mode === "sydes" && sydesIntegrationMode ? { SYDES_INTEGRATION_MODE: sydesIntegrationMode } : {}),
-    ...(requestPacingEnabled(options) ? {
+    ...(benchmarkProviderControlEnabled(options) ? {
       ...(options.modelTpmBudget > 0 ? { [MODEL_TPM_BUDGET_ENV]: String(options.modelTpmBudget) } : {}),
       ...(options.modelTpmBudget <= 0 && options.modelCallMinIntervalMs > 0 ? { [MODEL_CALL_MIN_INTERVAL_ENV]: String(options.modelCallMinIntervalMs) } : {}),
+      ...(options.maxProviderCalls > 0 ? { [MAX_PROVIDER_CALLS_ENV]: String(options.maxProviderCalls) } : {}),
       [MODEL_CALL_PACING_EVENTS_ENV]: join(modeDir, "provider-pacing-events.jsonl")
     } : {})
   };
@@ -220,6 +231,7 @@ export async function runSweBench(options: SweRunOptions, deps: SweDeps = defaul
     console.log(`Thinking: ${SWE_THINKING_LEVEL}`);
     console.log(`Max output tokens: ${SWE_MAX_OUTPUT_TOKENS}`);
     console.log(`Provider request pacing: ${formatRequestPacing(options)}`);
+    console.log(`Provider call budget: ${formatProviderCallBudget(options)}`);
     console.log(options.dryRun ? "Dry run: no model generation will be started." : "This will make one paid model run.");
     console.log(`OPENAI_API_KEY: ${options.env.OPENAI_API_KEY ? "SET" : "MISSING"}`);
 
@@ -233,6 +245,7 @@ export async function runSweBench(options: SweRunOptions, deps: SweDeps = defaul
       maxTokens: SWE_MAX_OUTPUT_TOKENS,
       integrationMode: options.mode === "sydes" ? options.sydesIntegrationMode ?? null : null,
       requestPacing: requestPacingMetadata(options),
+      providerCallBudget: providerCallBudgetMetadata(options),
       piAgentDir: options.piAgentDir,
       worktree,
       repoUrl,
@@ -298,6 +311,10 @@ export async function runSweBench(options: SweRunOptions, deps: SweDeps = defaul
         maxTokens: SWE_MAX_OUTPUT_TOKENS,
         integrationMode: options.mode === "sydes" ? options.sydesIntegrationMode ?? null : null,
         requestPacing: requestPacingMetadata(options),
+        providerCallBudget: providerCallBudgetMetadata(options),
+        providerCallsStarted: 0,
+        providerCallBudgetExhausted: false,
+        terminationReason: "dry_run",
         piAgentDir: options.piAgentDir,
         worktree,
         repoUrl,
@@ -317,7 +334,9 @@ export async function runSweBench(options: SweRunOptions, deps: SweDeps = defaul
       cwd: worktree,
       env: piEnv
     });
-    if (piExit !== 0) throw new Error(`Pi exited with ${piExit}; not retrying.`);
+    const providerTelemetry = await readProviderControlTelemetry(join(modeDir, "provider-pacing-events.jsonl"));
+    const budgetExhausted = providerTelemetry.providerCallBudgetExhausted;
+    if (piExit !== 0 && !budgetExhausted) throw new Error(`Pi exited with ${piExit}; not retrying.`);
 
     await assertHead(deps, worktree, manifest.base_commit);
     const diff = await deps.execFile("git", ["diff", "--binary", manifest.base_commit], { cwd: worktree });
@@ -332,6 +351,11 @@ export async function runSweBench(options: SweRunOptions, deps: SweDeps = defaul
       maxTokens: SWE_MAX_OUTPUT_TOKENS,
       integrationMode: options.mode === "sydes" ? options.sydesIntegrationMode ?? null : null,
       requestPacing: requestPacingMetadata(options),
+      providerCallBudget: providerCallBudgetMetadata(options),
+      providerCallsStarted: providerTelemetry.providerCallsStarted,
+      providerCallBudgetExhausted: budgetExhausted,
+      terminationReason: budgetExhausted ? PROVIDER_CALL_BUDGET_EXHAUSTED : "completed",
+      piExitCode: piExit,
       piAgentDir: options.piAgentDir,
       worktree,
       repoUrl,
@@ -592,10 +616,53 @@ function requestPacingEnabled(options: SweRunOptions): boolean {
   return options.modelTpmBudget > 0 || options.modelCallMinIntervalMs > 0;
 }
 
+function providerCallBudgetMetadata(options: SweRunOptions): Record<string, unknown> {
+  return {
+    enabled: options.maxProviderCalls > 0,
+    maxCalls: options.maxProviderCalls
+  };
+}
+
+function benchmarkProviderControlEnabled(options: SweRunOptions): boolean {
+  return requestPacingEnabled(options) || options.maxProviderCalls > 0;
+}
+
 function formatRequestPacing(options: SweRunOptions): string {
   if (options.modelTpmBudget > 0) return `rolling TPM budget ${options.modelTpmBudget}/60s`;
   if (options.modelCallMinIntervalMs > 0) return `${options.modelCallMinIntervalMs}ms fixed minimum interval`;
   return "disabled";
+}
+
+function formatProviderCallBudget(options: SweRunOptions): string {
+  return options.maxProviderCalls > 0 ? `${options.maxProviderCalls} provider calls` : "disabled";
+}
+
+async function readProviderControlTelemetry(path: string): Promise<{
+  providerCallsStarted: number;
+  providerCallBudgetExhausted: boolean;
+}> {
+  const text = await readFile(path, "utf8").catch(() => "");
+  if (!text.trim()) return { providerCallsStarted: 0, providerCallBudgetExhausted: false };
+  let providerCallsStarted = 0;
+  let providerCallBudgetExhausted = false;
+  for (const line of text.trim().split("\n")) {
+    const event = JSON.parse(line) as {
+      sequence?: unknown;
+      providerCallsStarted?: unknown;
+      providerCallBudgetExhausted?: unknown;
+      terminationReason?: unknown;
+    };
+    if (typeof event.sequence === "number" && event.providerCallBudgetExhausted !== true) {
+      providerCallsStarted = Math.max(providerCallsStarted, event.sequence);
+    }
+    if (event.providerCallBudgetExhausted === true || event.terminationReason === PROVIDER_CALL_BUDGET_EXHAUSTED) {
+      providerCallBudgetExhausted = true;
+      if (typeof event.providerCallsStarted === "number") {
+        providerCallsStarted = Math.max(providerCallsStarted, event.providerCallsStarted);
+      }
+    }
+  }
+  return { providerCallsStarted, providerCallBudgetExhausted };
 }
 
 function stringField(row: Record<string, unknown>, key: string): string {

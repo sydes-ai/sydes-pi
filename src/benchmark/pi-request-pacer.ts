@@ -5,8 +5,10 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 export const MODEL_CALL_MIN_INTERVAL_ENV = "SYDES_BENCH_MODEL_CALL_MIN_INTERVAL_MS";
 export const MODEL_TPM_BUDGET_ENV = "SYDES_BENCH_MODEL_TPM_BUDGET";
 export const MODEL_CALL_PACING_EVENTS_ENV = "SYDES_BENCH_PROVIDER_PACING_EVENTS_PATH";
+export const MAX_PROVIDER_CALLS_ENV = "SYDES_BENCH_MAX_PROVIDER_CALLS";
 const ROLLING_WINDOW_MS = 60_000;
 const CHARS_PER_TOKEN = 4;
+const PROVIDER_CALL_BUDGET_EXHAUSTED = "provider_call_budget_exhausted";
 
 export interface ProviderPacingEvent {
   sequence: number;
@@ -16,6 +18,10 @@ export interface ProviderPacingEvent {
   configuredBudget: number;
   waitedMs: number;
   oversizedRequest: boolean;
+  providerCallsStarted?: number;
+  providerCallBudgetMax?: number;
+  providerCallBudgetExhausted?: boolean;
+  terminationReason?: typeof PROVIDER_CALL_BUDGET_EXHAUSTED;
 }
 
 export interface ProviderRequestPacerDeps {
@@ -28,10 +34,11 @@ export interface ProviderRequestPacerDeps {
 export default function benchmarkRequestPacer(pi: ExtensionAPI): void {
   const tpmBudget = parseTpmBudget(process.env[MODEL_TPM_BUDGET_ENV]);
   const minIntervalMs = parseMinIntervalMs(process.env[MODEL_CALL_MIN_INTERVAL_ENV]);
-  if (tpmBudget <= 0 && minIntervalMs <= 0) return;
+  const maxProviderCalls = parseMaxProviderCalls(process.env[MAX_PROVIDER_CALLS_ENV]);
+  if (tpmBudget <= 0 && minIntervalMs <= 0 && maxProviderCalls <= 0) return;
 
   const eventsPath = process.env[MODEL_CALL_PACING_EVENTS_ENV];
-  const handler = tpmBudget > 0 ? createRollingTpmPacer(tpmBudget, {
+  const pacer = tpmBudget > 0 ? createRollingTpmPacer(tpmBudget, {
     now: () => Date.now(),
     sleep,
     writeEvent: eventsPath ? (event) => writePacingEvent(eventsPath, event) : undefined
@@ -40,8 +47,44 @@ export default function benchmarkRequestPacer(pi: ExtensionAPI): void {
     sleep,
     writeEvent: eventsPath ? (event) => writePacingEvent(eventsPath, event) : undefined
   });
+  const handler = maxProviderCalls > 0
+    ? createProviderCallBudget(maxProviderCalls, pacer, {
+      now: () => Date.now(),
+      writeEvent: eventsPath ? (event) => writePacingEvent(eventsPath, event) : undefined
+    })
+    : pacer;
 
   pi.on("before_provider_request", handler);
+}
+
+export function createProviderCallBudget(
+  maxProviderCalls: number,
+  next: (event: unknown, ctx: { signal?: AbortSignal }) => Promise<void>,
+  deps: Pick<ProviderRequestPacerDeps, "now" | "writeEvent">
+): (event: unknown, ctx: { signal?: AbortSignal }) => Promise<void> {
+  let requestsStarted = 0;
+  return async (event, ctx) => {
+    if (requestsStarted >= maxProviderCalls) {
+      if (deps.writeEvent) {
+        await deps.writeEvent({
+          sequence: requestsStarted + 1,
+          timestamp: new Date(deps.now()).toISOString(),
+          estimatedTokens: 0,
+          rollingTokensBefore: 0,
+          configuredBudget: maxProviderCalls,
+          waitedMs: 0,
+          oversizedRequest: false,
+          providerCallsStarted: requestsStarted,
+          providerCallBudgetMax: maxProviderCalls,
+          providerCallBudgetExhausted: true,
+          terminationReason: PROVIDER_CALL_BUDGET_EXHAUSTED
+        });
+      }
+      throw new Error(PROVIDER_CALL_BUDGET_EXHAUSTED);
+    }
+    requestsStarted += 1;
+    await next(event, ctx);
+  };
 }
 
 export function createProviderRequestPacer(
@@ -125,6 +168,13 @@ export function parseMinIntervalMs(value: string | undefined): number {
 }
 
 export function parseTpmBudget(value: string | undefined): number {
+  if (!value) return 0;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return 0;
+  return Math.floor(parsed);
+}
+
+export function parseMaxProviderCalls(value: string | undefined): number {
   if (!value) return 0;
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) return 0;

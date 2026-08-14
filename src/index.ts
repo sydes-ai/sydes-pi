@@ -13,9 +13,11 @@ export {
   createBeforeAgentStartHandler,
   createSydesExtension,
   default,
+  handleToolMiddlewareToolResult,
   maybeSendImpactGuidance,
   observeMutationResult,
   recordExplorationToolResult,
+  SYDES_STRUCTURAL_CONTEXT_HEADER,
   renderDebugContext,
   renderImpactDebugContext,
   shouldInjectForPrompt

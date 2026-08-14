@@ -82,7 +82,8 @@ function makeState(): SydesRuntimeState {
     explorationTelemetry: {
       sequence: 0,
       startedAt: 0,
-      seenTargets: new Set()
+      seenTargets: new Set(),
+      enrichedReadTargets: new Set()
     }
   };
 }

@@ -23,9 +23,12 @@ import {
   gitDiffProvider,
   normalizeRepoPath as normalizeImpactPath
 } from "./policy/impact.js";
-import type { AffectedContext, ChangeSurfaceDrift, RelevantContext } from "./policy/types.js";
+import type { AffectedContext, ChangeSurfaceDrift, PolicyCbmClient, RelevantContext } from "./policy/types.js";
 import type { ProjectEnsureCacheEntry } from "./policy/types.js";
 import { SydesTelemetryRecorder, type ExplorationToolEvent } from "./telemetry/recorder.js";
+
+const STRUCTURAL_CONTEXT_CHAR_BUDGET = 2400;
+export const SYDES_STRUCTURAL_CONTEXT_HEADER = "[Sydes structural context]";
 
 export interface SydesExtensionContext {
   registerTool?: (tool: unknown) => void;
@@ -87,6 +90,14 @@ export interface ExplorationTelemetryState {
   sequence: number;
   startedAt: number;
   seenTargets: Set<string>;
+  enrichedReadTargets: Set<string>;
+}
+
+export interface SydesToolResultEventResult {
+  content?: ToolResultEvent["content"];
+  details?: unknown;
+  isError?: boolean;
+  usage?: ToolResultEvent["usage"];
 }
 
 export interface ObservedMutation {
@@ -120,7 +131,8 @@ export default function sydesPiExtension(pi: ExtensionAPI): void {
     explorationTelemetry: {
       sequence: 0,
       startedAt: Date.now(),
-      seenTargets: new Set()
+      seenTargets: new Set(),
+      enrichedReadTargets: new Set()
     }
   };
 
@@ -248,7 +260,7 @@ export default function sydesPiExtension(pi: ExtensionAPI): void {
   if (extension.integrationMode === "tool-middleware") {
     pi.on("tool_call", observeExplorationToolCall);
     pi.on("tool_result", async (event, ctx) => {
-      await recordExplorationToolResult(event, ctx.cwd, state);
+      return handleToolMiddlewareToolResult(event, ctx.cwd, state, extension.cbm);
     });
   } else {
     pi.on("before_agent_start", createBeforeAgentStartHandler(extension.cbm, state));
@@ -280,6 +292,16 @@ export async function recordExplorationToolResult(
   state: SydesRuntimeState,
   now: () => number = Date.now
 ): Promise<ExplorationToolEvent | null> {
+  return recordExplorationToolResultWithEnrichment(event, repoPath, state, now);
+}
+
+async function recordExplorationToolResultWithEnrichment(
+  event: ToolResultEvent,
+  repoPath: string,
+  state: SydesRuntimeState,
+  now: () => number,
+  enrichment?: ExplorationToolEvent["enrichment"]
+): Promise<ExplorationToolEvent | null> {
   if (!isExplorationTool(event.toolName)) {
     return null;
   }
@@ -299,10 +321,372 @@ export async function recordExplorationToolResult(
     timestamp: new Date(timestampMs).toISOString(),
     elapsedMs: Math.max(0, timestampMs - state.explorationTelemetry.startedAt),
     resultSizeBytes: safeResultSize(event.content),
-    isError: event.isError
+    isError: event.isError,
+    enrichment
   };
   await state.telemetry?.recordExplorationToolEvent?.(explorationEvent);
   return explorationEvent;
+}
+
+export async function handleToolMiddlewareToolResult(
+  event: ToolResultEvent,
+  repoPath: string,
+  state: SydesRuntimeState,
+  cbm: PolicyCbmClient,
+  now: () => number = Date.now
+): Promise<SydesToolResultEventResult | undefined> {
+  if (!isExplorationTool(event.toolName)) {
+    return undefined;
+  }
+
+  const normalized = normalizeExplorationTarget(event.toolName, event.input, repoPath);
+  let enrichment: ExplorationToolEvent["enrichment"];
+  let footer: string | undefined;
+  if (event.toolName === "read") {
+    const readEnrichment = await maybeBuildReadEnrichment(event, repoPath, state, cbm, normalized.normalizedTarget);
+    enrichment = readEnrichment.telemetry;
+    footer = readEnrichment.footer;
+  } else {
+    enrichment = {
+      anchorPath: normalized.normalizedTarget,
+      cbmQueryCount: 0,
+      cbmElapsedMs: 0,
+      generated: false,
+      enrichmentBytes: 0,
+      relationshipsReturned: 0,
+      filesSuggested: [],
+      testsSuggested: [],
+      skippedReason: "passive_search_tool"
+    };
+  }
+
+  await recordExplorationToolResultWithEnrichment(event, repoPath, state, now, enrichment);
+  if (!footer) {
+    return undefined;
+  }
+
+  return {
+    content: [...event.content, { type: "text", text: `\n\n${footer}` }],
+    details: event.details,
+    isError: event.isError,
+    usage: event.usage
+  };
+}
+
+interface ReadEnrichmentResult {
+  footer?: string;
+  telemetry: NonNullable<ExplorationToolEvent["enrichment"]>;
+}
+
+interface StructuralSymbol {
+  name: string;
+  qualifiedName: string;
+  kind?: string;
+  filePath?: string;
+}
+
+interface StructuralRelationship {
+  from: string;
+  to: string;
+  type: string;
+}
+
+async function maybeBuildReadEnrichment(
+  event: ToolResultEvent,
+  repoPath: string,
+  state: SydesRuntimeState,
+  cbm: PolicyCbmClient,
+  anchorPath: string | undefined,
+  now: () => number = Date.now
+): Promise<ReadEnrichmentResult> {
+  const startedAt = now();
+  const base = (overrides: Partial<NonNullable<ExplorationToolEvent["enrichment"]>>): ReadEnrichmentResult => ({
+    telemetry: {
+      anchorPath,
+      cbmQueryCount: 0,
+      cbmElapsedMs: Math.max(0, now() - startedAt),
+      generated: false,
+      enrichmentBytes: 0,
+      relationshipsReturned: 0,
+      filesSuggested: [],
+      testsSuggested: [],
+      ...overrides
+    }
+  });
+
+  if (event.isError) {
+    return base({ skippedReason: "read_error" });
+  }
+  if (!anchorPath) {
+    return base({ skippedReason: "no_anchor_path" });
+  }
+  if (state.explorationTelemetry.enrichedReadTargets.has(anchorPath)) {
+    return base({ skippedReason: "already_enriched" });
+  }
+  state.explorationTelemetry.enrichedReadTargets.add(anchorPath);
+
+  let cbmQueryCount = 0;
+  try {
+    const resolution = await ensureProjectForRepo(repoPath, cbm, {
+      allowIndex: true,
+      cache: state.projectCache
+    });
+    if (!resolution.project?.name) {
+      return base({
+        cbmElapsedMs: Math.max(0, now() - startedAt),
+        failureReason: resolution.reason ?? "project_unresolved"
+      });
+    }
+
+    cbmQueryCount += 1;
+    const graph = await cbm.searchGraphByArgs({
+      project: resolution.project.name,
+      query: anchorPath,
+      limit: 12
+    });
+    const symbols = uniqueSymbols(rowsFromCbmResult(graph).map((row) => symbolFromRow(row))).filter(
+      (symbol): symbol is StructuralSymbol => !!symbol && symbol.filePath === anchorPath
+    );
+
+    const relationships: StructuralRelationship[] = [];
+    const relatedSymbols: StructuralSymbol[] = [];
+    for (const symbol of symbols.slice(0, 2)) {
+      cbmQueryCount += 1;
+      const trace = await cbm.tracePath(resolution.project.name, symbol.qualifiedName);
+      const traced = parseTraceSymbols(trace, symbol.qualifiedName);
+      relatedSymbols.push(...traced.symbols);
+      relationships.push(...traced.relationships);
+    }
+
+    const footer = renderStructuralFooter(anchorPath, symbols, relatedSymbols, relationships);
+    const filesSuggested = uniqueStrings(relatedSymbols.map((symbol) => symbol.filePath).filter(isDefined))
+      .filter((path) => path !== anchorPath && !isTestPath(path))
+      .slice(0, 6);
+    const testsSuggested = uniqueStrings(relatedSymbols.map((symbol) => symbol.filePath).filter(isDefined))
+      .filter(isTestPath)
+      .slice(0, 4);
+
+    if (!footer) {
+      return base({
+        cbmQueryCount,
+        cbmElapsedMs: Math.max(0, now() - startedAt),
+        skippedReason: "no_structural_context"
+      });
+    }
+
+    return {
+      footer,
+      telemetry: {
+        anchorPath,
+        cbmQueryCount,
+        cbmElapsedMs: Math.max(0, now() - startedAt),
+        generated: true,
+        enrichmentBytes: Buffer.byteLength(footer, "utf8"),
+        relationshipsReturned: relationships.length,
+        filesSuggested,
+        testsSuggested
+      }
+    };
+  } catch (error) {
+    return base({
+      cbmQueryCount,
+      cbmElapsedMs: Math.max(0, now() - startedAt),
+      failureReason: error instanceof Error ? error.message : String(error)
+    });
+  }
+}
+
+function renderStructuralFooter(
+  anchorPath: string,
+  symbols: StructuralSymbol[],
+  relatedSymbols: StructuralSymbol[],
+  relationships: StructuralRelationship[]
+): string | undefined {
+  const sameFileSymbols = uniqueStrings(symbols.map((symbol) => displaySymbol(symbol))).slice(0, 6);
+  const related = uniqueStrings(relatedSymbols.map((symbol) => displaySymbol(symbol))).filter((name) => !sameFileSymbols.includes(name)).slice(0, 6);
+  const files = uniqueStrings(relatedSymbols.map((symbol) => symbol.filePath).filter(isDefined))
+    .filter((path) => path !== anchorPath && !isTestPath(path))
+    .slice(0, 6);
+  const tests = uniqueStrings(relatedSymbols.map((symbol) => symbol.filePath).filter(isDefined))
+    .filter(isTestPath)
+    .slice(0, 4);
+
+  if (sameFileSymbols.length === 0 && related.length === 0 && files.length === 0 && tests.length === 0) {
+    return undefined;
+  }
+
+  const lines = [
+    SYDES_STRUCTURAL_CONTEXT_HEADER,
+    `Anchor file: ${anchorPath}`,
+    formatFooterList("Symbols in this file", sameFileSymbols),
+    formatFooterList("Related symbols", related),
+    formatFooterList("Connected files", files),
+    formatFooterList("Related tests", tests),
+    relationships.length ? `Relationships returned: ${relationships.length}` : undefined,
+    "Verify graph hints against source before editing."
+  ].filter(isDefined);
+  return boundFooter(lines.join("\n"));
+}
+
+function formatFooterList(label: string, values: string[]): string | undefined {
+  if (values.length === 0) {
+    return undefined;
+  }
+  return [`${label}:`, ...values.map((value) => `- ${value}`)].join("\n");
+}
+
+function boundFooter(text: string): string {
+  if (text.length <= STRUCTURAL_CONTEXT_CHAR_BUDGET) {
+    return text;
+  }
+  const lines: string[] = [];
+  for (const line of text.split("\n")) {
+    const candidate = [...lines, line, "..."].join("\n");
+    if (candidate.length > STRUCTURAL_CONTEXT_CHAR_BUDGET) {
+      break;
+    }
+    lines.push(line);
+  }
+  return [...lines, "..."].join("\n");
+}
+
+function rowsFromCbmResult(result: { parsed?: unknown } | unknown): Record<string, unknown>[] {
+  const parsed = isRecord(result) && "parsed" in result ? result.parsed : result;
+  const content = unwrapStructuredContent(parsed);
+  return collectRows(content);
+}
+
+function unwrapStructuredContent(value: unknown): unknown {
+  if (isRecord(value) && "structuredContent" in value) {
+    return value.structuredContent;
+  }
+  if (isRecord(value) && "parsed" in value) {
+    return unwrapStructuredContent(value.parsed);
+  }
+  return value;
+}
+
+function collectRows(value: unknown): Record<string, unknown>[] {
+  if (!isRecord(value)) {
+    return [];
+  }
+  const rows: Record<string, unknown>[] = [];
+  if (Array.isArray(value.rows) && Array.isArray(value.cols)) {
+    rows.push(...rowsWithCols(value.cols, value.rows));
+  }
+  if (Array.isArray(value.groups)) {
+    for (const group of value.groups) {
+      if (!isRecord(group) || !Array.isArray(group.rows)) {
+        continue;
+      }
+      const groupRows = Array.isArray(group.cols) ? group.rows : group.rows;
+      const cols = Array.isArray(group.cols) ? group.cols : Array.isArray(value.cols) ? value.cols : [];
+      rows.push(
+        ...rowsWithCols(cols, groupRows).map((row) => ({
+          ...row,
+          qn_prefix: typeof group.qn_prefix === "string" ? group.qn_prefix : undefined,
+          file: row.file ?? group.file
+        }))
+      );
+    }
+  }
+  for (const key of ["callers", "callees", "symbols", "matches"]) {
+    if (key in value) {
+      rows.push(...collectRows(value[key]));
+    }
+  }
+  return rows;
+}
+
+function rowsWithCols(cols: unknown[], rows: unknown[]): Record<string, unknown>[] {
+  return rows
+    .filter((row): row is unknown[] => Array.isArray(row))
+    .map((row) =>
+      Object.fromEntries(
+        cols.map((col, index) => [String(col), row[index]])
+      )
+    );
+}
+
+function symbolFromRow(row: Record<string, unknown>): StructuralSymbol | undefined {
+  const qualifiedName = stringValue(row.qn) ?? stringValue(row.qualifiedName) ?? joinedQualifiedName(row);
+  const name = stringValue(row.name) ?? leafName(qualifiedName);
+  if (!qualifiedName || !name) {
+    return undefined;
+  }
+  return {
+    name,
+    qualifiedName,
+    kind: stringValue(row.label) ?? stringValue(row.kind),
+    filePath: stringValue(row.file) ?? stringValue(row.filePath)
+  };
+}
+
+function parseTraceSymbols(result: { parsed?: unknown } | unknown, sourceQualifiedName: string): { symbols: StructuralSymbol[]; relationships: StructuralRelationship[] } {
+  const symbols = uniqueSymbols(rowsFromCbmResult(result).map((row) => symbolFromRow(row))).filter(isDefined);
+  return {
+    symbols,
+    relationships: symbols.map((symbol) => ({
+      from: sourceQualifiedName,
+      to: symbol.qualifiedName,
+      type: "related"
+    }))
+  };
+}
+
+function joinedQualifiedName(row: Record<string, unknown>): string | undefined {
+  const prefix = stringValue(row.qn_prefix);
+  const name = stringValue(row.name);
+  return prefix && name ? `${prefix}.${name}` : undefined;
+}
+
+function displaySymbol(symbol: StructuralSymbol): string {
+  const kind = symbol.kind ? `${symbol.kind} ` : "";
+  const location = symbol.filePath ? ` (${symbol.filePath})` : "";
+  return `${kind}${symbol.name}${location}`;
+}
+
+function leafName(qualifiedName: string | undefined): string | undefined {
+  if (!qualifiedName) {
+    return undefined;
+  }
+  const parts = qualifiedName.split(".");
+  return parts[parts.length - 1];
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function isTestPath(path: string): boolean {
+  return /(^|\/)(test|tests|spec|__tests__)(\/|$)|(_test|\.test|\.spec)\.[^.]+$/i.test(path);
+}
+
+function uniqueSymbols(symbols: Array<StructuralSymbol | undefined>): StructuralSymbol[] {
+  const seen = new Set<string>();
+  return symbols.filter((symbol): symbol is StructuralSymbol => {
+    if (!symbol) {
+      return false;
+    }
+    const key = symbol.qualifiedName;
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+function isDefined<T>(value: T | undefined): value is T {
+  return value !== undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
 export function createBeforeAgentStartHandler(cbm: CbmClient, state: SydesRuntimeState) {

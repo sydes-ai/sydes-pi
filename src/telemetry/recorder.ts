@@ -14,6 +14,18 @@ export interface ExplorationToolEvent {
   elapsedMs: number;
   resultSizeBytes: number;
   isError: boolean;
+  enrichment?: {
+    anchorPath?: string;
+    cbmQueryCount: number;
+    cbmElapsedMs: number;
+    generated: boolean;
+    enrichmentBytes: number;
+    relationshipsReturned: number;
+    filesSuggested: string[];
+    testsSuggested: string[];
+    skippedReason?: string;
+    failureReason?: string;
+  };
 }
 
 export interface SydesTelemetry {

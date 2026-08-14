@@ -4,7 +4,14 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { createBeforeAgentStartHandler, recordExplorationToolResult, shouldInjectForPrompt, type SydesRuntimeState } from "../src/extension.js";
+import {
+  createBeforeAgentStartHandler,
+  handleToolMiddlewareToolResult,
+  recordExplorationToolResult,
+  shouldInjectForPrompt,
+  SYDES_STRUCTURAL_CONTEXT_HEADER,
+  type SydesRuntimeState
+} from "../src/extension.js";
 import {
   buildExplorationGuidance,
   buildRelevantContext,
@@ -61,6 +68,40 @@ function makeClient(overrides: Partial<PolicyCbmClient> = {}): PolicyCbmClient {
     ),
     ...overrides
   };
+}
+
+function makeStructuralReadClient(overrides: Partial<PolicyCbmClient> = {}): PolicyCbmClient {
+  return makeClient({
+    searchGraphByArgs: vi.fn(async (args) => {
+      if (args.query === "pkg/handler/pokedex.go") {
+        return envelope({
+          total: 2,
+          cols: ["qn", "label", "file", "lines", "rank"],
+          rows: [
+            [`${projectName}.pkg.handler.addPokemon`, "Method", "pkg/handler/pokedex.go", "19-41", -15],
+            [`${projectName}.pkg.handler.InitRoutes`, "Function", "pkg/handler/pokedex.go", "8-18", -14]
+          ],
+          has_more: false
+        });
+      }
+      return envelope({ total: 0, cols: ["qn", "label", "file", "lines", "rank"], rows: [], has_more: false });
+    }),
+    tracePath: vi.fn(async () =>
+      envelope({
+        function: `${projectName}.pkg.handler.addPokemon`,
+        direction: "both",
+        callers: {
+          cols: ["qn", "label", "file", "lines"],
+          rows: [[`${projectName}.pkg.handler.TestAddPokemon`, "Test", "pkg/handler/pokedex_test.go", "10-20"]]
+        },
+        callees: {
+          cols: ["qn", "label", "file", "lines"],
+          rows: [[`${projectName}.pkg.service.AddPokemon`, "Method", "pkg/service/pokemon.go", "16-18"]]
+        }
+      })
+    ),
+    ...overrides
+  });
 }
 
 describe("Phase 1 exploration policy", () => {
@@ -485,19 +526,130 @@ describe("Phase 1 exploration policy", () => {
     expect(find?.normalizedTarget).toBeUndefined();
   });
 
-  it("does not query CBM because of intercepted read or search results", async () => {
+  it("appends structural context to the first successful read result", async () => {
     const state = makeState();
-    const client = makeClient();
-    await recordExplorationToolResult({
+    const client = makeStructuralReadClient();
+    const originalContent = [{ type: "text", text: "package handler" }];
+    const result = await handleToolMiddlewareToolResult({
       type: "tool_result",
       toolName: "read",
       toolCallId: "read-1",
       input: { path: "/tmp/pokemon-api/pkg/handler/pokedex.go" },
-      content: [{ type: "text", text: "ok" }],
+      content: originalContent,
+      details: { bytes: 15 },
+      usage: { inputTokens: 1, outputTokens: 0 },
+      isError: false
+    } as never, repoPath, state, client, () => 1100);
+
+    expect(result?.content?.[0]).toBe(originalContent[0]);
+    expect(result?.content?.[1]).toMatchObject({
+      type: "text",
+      text: expect.stringContaining(SYDES_STRUCTURAL_CONTEXT_HEADER)
+    });
+    expect(JSON.stringify(result?.content)).toContain("Anchor file: pkg/handler/pokedex.go");
+    expect(JSON.stringify(result?.content)).toContain("AddPokemon");
+    expect(JSON.stringify(result?.content)).toContain("pkg/service/pokemon.go");
+    expect(JSON.stringify(result?.content)).toContain("pkg/handler/pokedex_test.go");
+    expect(result?.details).toEqual({ bytes: 15 });
+    expect(result?.isError).toBe(false);
+    expect(client.searchGraphByArgs).toHaveBeenCalledWith({
+      project: projectName,
+      query: "pkg/handler/pokedex.go",
+      limit: 12
+    });
+    expect(client.tracePath).toHaveBeenCalledWith(projectName, `${projectName}.pkg.handler.addPokemon`);
+    expect(state.telemetry?.recordExplorationToolEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        enrichment: expect.objectContaining({
+          anchorPath: "pkg/handler/pokedex.go",
+          cbmQueryCount: 3,
+          generated: true,
+          relationshipsReturned: 4,
+          filesSuggested: ["pkg/service/pokemon.go"],
+          testsSuggested: ["pkg/handler/pokedex_test.go"]
+        })
+      })
+    );
+  });
+
+  it("uses the concrete read file as the graph anchor, not task prose", async () => {
+    const state = makeState();
+    const client = makeStructuralReadClient();
+    await handleToolMiddlewareToolResult({
+      type: "tool_result",
+      toolName: "read",
+      toolCallId: "read-1",
+      input: { path: "/tmp/pokemon-api/pkg/handler/pokedex.go" },
+      content: [{ type: "text", text: "package handler" }],
       details: undefined,
       isError: false
-    } as never, repoPath, state);
-    await recordExplorationToolResult({
+    } as never, repoPath, state, client);
+
+    const graphArgs = vi.mocked(client.searchGraphByArgs).mock.calls.map(([args]) => JSON.stringify(args)).join("\n");
+    expect(graphArgs).toContain("pkg/handler/pokedex.go");
+    expect(graphArgs).not.toContain("POST /api/v1/pokemon");
+    expect(graphArgs).not.toContain("hp=0");
+  });
+
+  it("does not repeat CBM enrichment for repeated reads of the same normalized file", async () => {
+    const state = makeState();
+    const client = makeStructuralReadClient();
+    const event = {
+      type: "tool_result",
+      toolName: "read",
+      toolCallId: "read-1",
+      input: { path: "/tmp/pokemon-api/pkg/handler/pokedex.go" },
+      content: [{ type: "text", text: "package handler" }],
+      details: undefined,
+      isError: false
+    } as ToolResultEvent;
+
+    const first = await handleToolMiddlewareToolResult(event, repoPath, state, client, () => 1100);
+    const second = await handleToolMiddlewareToolResult({ ...event, toolCallId: "read-2" } as ToolResultEvent, repoPath, state, client, () => 1200);
+
+    expect(first?.content?.length).toBe(2);
+    expect(second).toBeUndefined();
+    expect(client.searchGraphByArgs).toHaveBeenCalledTimes(1);
+    expect(client.tracePath).toHaveBeenCalledTimes(2);
+    expect(state.telemetry?.recordExplorationToolEvent).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        repeated: true,
+        enrichment: expect.objectContaining({
+          generated: false,
+          skippedReason: "already_enriched"
+        })
+      })
+    );
+  });
+
+  it("leaves read output unchanged when CBM enrichment fails", async () => {
+    const state = makeState();
+    const client = makeStructuralReadClient({ searchGraphByArgs: vi.fn(async () => Promise.reject(new Error("cbm unavailable"))) });
+    const result = await handleToolMiddlewareToolResult({
+      type: "tool_result",
+      toolName: "read",
+      toolCallId: "read-1",
+      input: { path: "/tmp/pokemon-api/pkg/handler/pokedex.go" },
+      content: [{ type: "text", text: "package handler" }],
+      details: undefined,
+      isError: false
+    } as never, repoPath, state, client, () => 1100);
+
+    expect(result).toBeUndefined();
+    expect(state.telemetry?.recordExplorationToolEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        enrichment: expect.objectContaining({
+          generated: false,
+          failureReason: "cbm unavailable"
+        })
+      })
+    );
+  });
+
+  it("keeps grep and find passive without querying CBM", async () => {
+    const state = makeState();
+    const client = makeStructuralReadClient();
+    await handleToolMiddlewareToolResult({
       type: "tool_result",
       toolName: "grep",
       toolCallId: "grep-1",
@@ -505,10 +657,57 @@ describe("Phase 1 exploration policy", () => {
       content: [{ type: "text", text: "ok" }],
       details: undefined,
       isError: false
-    } as never, repoPath, state);
+    } as never, repoPath, state, client);
     expect(client.listProjects).not.toHaveBeenCalled();
     expect(client.searchGraphByArgs).not.toHaveBeenCalled();
     expect(client.tracePath).not.toHaveBeenCalled();
+  });
+
+  it("leaves non-read repository tools unchanged in tool-middleware handling", async () => {
+    const state = makeState();
+    const client = makeStructuralReadClient();
+    const result = await handleToolMiddlewareToolResult({
+      type: "tool_result",
+      toolName: "edit",
+      toolCallId: "edit-1",
+      input: { path: "/tmp/pokemon-api/pkg/handler/pokedex.go" },
+      content: [{ type: "text", text: "edited" }],
+      details: undefined,
+      isError: false
+    } as never, repoPath, state, client);
+
+    expect(result).toBeUndefined();
+    expect(client.listProjects).not.toHaveBeenCalled();
+    expect(state.telemetry?.recordExplorationToolEvent).not.toHaveBeenCalled();
+  });
+
+  it("bounds structural read enrichment to a small footer", async () => {
+    const state = makeState();
+    const rows = Array.from({ length: 80 }, (_, index) => [
+      `${projectName}.pkg.handler.Symbol${index}`,
+      "Method",
+      "pkg/handler/pokedex.go",
+      `${index + 1}-${index + 2}`,
+      -index
+    ]);
+    const client = makeStructuralReadClient({
+      searchGraphByArgs: vi.fn(async () =>
+        envelope({ total: rows.length, cols: ["qn", "label", "file", "lines", "rank"], rows, has_more: false })
+      )
+    });
+    const result = await handleToolMiddlewareToolResult({
+      type: "tool_result",
+      toolName: "read",
+      toolCallId: "read-1",
+      input: { path: "/tmp/pokemon-api/pkg/handler/pokedex.go" },
+      content: [{ type: "text", text: "package handler" }],
+      details: undefined,
+      isError: false
+    } as never, repoPath, state, client);
+
+    const footer = result?.content?.[1];
+    expect(footer).toMatchObject({ type: "text" });
+    expect(JSON.stringify(footer).length).toBeLessThan(2600);
   });
 });
 
@@ -528,7 +727,8 @@ function makeState(): SydesRuntimeState {
     explorationTelemetry: {
       sequence: 0,
       startedAt: 1000,
-      seenTargets: new Set<string>()
+      seenTargets: new Set<string>(),
+      enrichedReadTargets: new Set<string>()
     },
     telemetry: {
       recordExplorationToolEvent: vi.fn(async () => undefined)

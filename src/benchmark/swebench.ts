@@ -9,6 +9,7 @@ import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { CbmClient } from "../cbm/client.js";
 import type { SydesIntegrationMode } from "../config.js";
+import { MODEL_CALL_MIN_INTERVAL_ENV, MODEL_CALL_PACING_EVENTS_ENV } from "./pi-request-pacer.js";
 import { buildRelevantContext, ensureProjectForRepo } from "../policy/exploration.js";
 import { analyzeSession } from "../telemetry/session-analyzer.js";
 
@@ -18,6 +19,7 @@ export const DEFAULT_MODEL = "openai/gpt-5-nano";
 export const SWE_THINKING_LEVEL = "medium";
 export const SWE_MAX_OUTPUT_TOKENS = 16384;
 export const SWE_PI_AGENT_DIR = resolve("benchmarks/pi-agent");
+export const SWE_REQUEST_PACER_EXTENSION_PATH = resolve("src/benchmark/pi-request-pacer.ts");
 export type SweMode = "stock" | "sydes";
 
 export interface SweManifest {
@@ -47,9 +49,11 @@ export interface SweRunOptions {
   artifactsRoot: string;
   piBin: string;
   extensionPath: string;
+  requestPacerExtensionPath: string;
   piAgentDir: string;
   cbmBin: string;
   sydesIntegrationMode?: SydesIntegrationMode;
+  modelCallMinIntervalMs: number;
   env: NodeJS.ProcessEnv;
 }
 
@@ -73,9 +77,17 @@ export function parseSweArgs(argv: string[], env: NodeJS.ProcessEnv = process.en
     artifactsRoot: resolve(home, ".sydes-pi/swebench"),
     piBin: resolve("node_modules/.bin/pi"),
     extensionPath: resolve("src/index.ts"),
+    requestPacerExtensionPath: SWE_REQUEST_PACER_EXTENSION_PATH,
     piAgentDir: SWE_PI_AGENT_DIR,
     cbmBin: resolve("node_modules/.bin/codebase-memory-mcp"),
     sydesIntegrationMode: parseSydesIntegrationMode(valueAfter(argv, "--sydes-integration-mode") ?? valueWithPrefix(argv, "--sydes-integration-mode=")),
+    modelCallMinIntervalMs: parseNonNegativeInt(
+      valueAfter(argv, "--model-call-min-interval-ms")
+        ?? valueWithPrefix(argv, "--model-call-min-interval-ms=")
+        ?? env[MODEL_CALL_MIN_INTERVAL_ENV]
+        ?? "0",
+      "--model-call-min-interval-ms"
+    ),
     env
   };
 }
@@ -141,6 +153,9 @@ export function buildSwePiCommand(options: SweRunOptions, manifest: SweManifest,
   const sessionDir = join(runDir, "pi-sessions");
   const prompt = buildSweTaskPrompt(manifest.problem_statement);
   const args = ["--model", options.model, "--thinking", SWE_THINKING_LEVEL, "--mode", "text", "--print", "--no-extensions"];
+  if (options.modelCallMinIntervalMs > 0) {
+    args.push("--extension", options.requestPacerExtensionPath);
+  }
   if (options.mode === "sydes") {
     args.push("--extension", options.extensionPath);
   }
@@ -149,14 +164,23 @@ export function buildSwePiCommand(options: SweRunOptions, manifest: SweManifest,
 }
 
 export function buildSwePiEnv(options: SweRunOptions, modeDir: string, sessionDir: string): NodeJS.ProcessEnv {
-  const { SYDES_INTEGRATION_MODE: _discarded, ...baseEnv } = options.env;
+  const {
+    SYDES_INTEGRATION_MODE: _discarded,
+    [MODEL_CALL_MIN_INTERVAL_ENV]: _discardedMinInterval,
+    [MODEL_CALL_PACING_EVENTS_ENV]: _discardedEvents,
+    ...baseEnv
+  } = options.env;
   const sydesIntegrationMode = options.sydesIntegrationMode ?? options.env.SYDES_INTEGRATION_MODE;
   return {
     ...baseEnv,
     PI_CODING_AGENT_DIR: options.piAgentDir,
     SYDES_RUN_DIR: options.mode === "sydes" ? modeDir : "",
     PI_CODING_AGENT_SESSION_DIR: sessionDir,
-    ...(options.mode === "sydes" && sydesIntegrationMode ? { SYDES_INTEGRATION_MODE: sydesIntegrationMode } : {})
+    ...(options.mode === "sydes" && sydesIntegrationMode ? { SYDES_INTEGRATION_MODE: sydesIntegrationMode } : {}),
+    ...(options.modelCallMinIntervalMs > 0 ? {
+      [MODEL_CALL_MIN_INTERVAL_ENV]: String(options.modelCallMinIntervalMs),
+      [MODEL_CALL_PACING_EVENTS_ENV]: join(modeDir, "provider-pacing-events.jsonl")
+    } : {})
   };
 }
 
@@ -185,6 +209,7 @@ export async function runSweBench(options: SweRunOptions, deps: SweDeps = defaul
     console.log(`Model: ${options.model}`);
     console.log(`Thinking: ${SWE_THINKING_LEVEL}`);
     console.log(`Max output tokens: ${SWE_MAX_OUTPUT_TOKENS}`);
+    console.log(`Provider request pacing: ${options.modelCallMinIntervalMs > 0 ? `${options.modelCallMinIntervalMs}ms` : "disabled"}`);
     console.log(options.dryRun ? "Dry run: no model generation will be started." : "This will make one paid model run.");
     console.log(`OPENAI_API_KEY: ${options.env.OPENAI_API_KEY ? "SET" : "MISSING"}`);
 
@@ -197,6 +222,7 @@ export async function runSweBench(options: SweRunOptions, deps: SweDeps = defaul
       thinking: SWE_THINKING_LEVEL,
       maxTokens: SWE_MAX_OUTPUT_TOKENS,
       integrationMode: options.mode === "sydes" ? options.sydesIntegrationMode ?? null : null,
+      requestPacing: requestPacingMetadata(options),
       piAgentDir: options.piAgentDir,
       worktree,
       repoUrl,
@@ -261,6 +287,7 @@ export async function runSweBench(options: SweRunOptions, deps: SweDeps = defaul
         thinking: SWE_THINKING_LEVEL,
         maxTokens: SWE_MAX_OUTPUT_TOKENS,
         integrationMode: options.mode === "sydes" ? options.sydesIntegrationMode ?? null : null,
+        requestPacing: requestPacingMetadata(options),
         piAgentDir: options.piAgentDir,
         worktree,
         repoUrl,
@@ -294,6 +321,7 @@ export async function runSweBench(options: SweRunOptions, deps: SweDeps = defaul
       thinking: SWE_THINKING_LEVEL,
       maxTokens: SWE_MAX_OUTPUT_TOKENS,
       integrationMode: options.mode === "sydes" ? options.sydesIntegrationMode ?? null : null,
+      requestPacing: requestPacingMetadata(options),
       piAgentDir: options.piAgentDir,
       worktree,
       repoUrl,
@@ -532,6 +560,19 @@ function parseSydesIntegrationMode(value: string | undefined): SydesIntegrationM
   if (value === undefined) return undefined;
   if (value === "graph-guidance" || value === "tool-middleware") return value;
   throw new Error("--sydes-integration-mode must be graph-guidance or tool-middleware");
+}
+
+function parseNonNegativeInt(value: string, flag: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) throw new Error(`${flag} must be a non-negative integer`);
+  return parsed;
+}
+
+function requestPacingMetadata(options: SweRunOptions): Record<string, unknown> {
+  return {
+    enabled: options.modelCallMinIntervalMs > 0,
+    minIntervalMs: options.modelCallMinIntervalMs
+  };
 }
 
 function stringField(row: Record<string, unknown>, key: string): string {

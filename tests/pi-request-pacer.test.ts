@@ -1,0 +1,96 @@
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import benchmarkRequestPacer, {
+  MODEL_CALL_MIN_INTERVAL_ENV,
+  MODEL_CALL_PACING_EVENTS_ENV,
+  createProviderRequestPacer,
+  parseMinIntervalMs
+} from "../src/benchmark/pi-request-pacer.js";
+
+const tempRoots: string[] = [];
+
+afterEach(async () => {
+  delete process.env[MODEL_CALL_MIN_INTERVAL_ENV];
+  delete process.env[MODEL_CALL_PACING_EVENTS_ENV];
+  await Promise.all(tempRoots.map((root) => rm(root, { recursive: true, force: true })));
+  tempRoots.length = 0;
+});
+
+describe("benchmark Pi request pacer", () => {
+  it("is disabled by default", () => {
+    const pi = fakePi();
+    benchmarkRequestPacer(pi as never);
+    expect(pi.handlers).toHaveLength(0);
+    expect(parseMinIntervalMs(undefined)).toBe(0);
+    expect(parseMinIntervalMs("bad")).toBe(0);
+  });
+
+  it("paces first, repeated, and after-interval provider requests deterministically", async () => {
+    let now = 1_000;
+    const sleeps: number[] = [];
+    const events: unknown[] = [];
+    const handler = createProviderRequestPacer(65_000, {
+      now: () => now,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        now += ms;
+      },
+      writeEvent: async (event) => {
+        events.push(event);
+      }
+    });
+
+    await expect(handler({ payload: "first" }, {})).resolves.toBeUndefined();
+    now += 5_000;
+    await expect(handler({ payload: "second" }, {})).resolves.toBeUndefined();
+    now += 65_000;
+    await expect(handler({ payload: "third" }, {})).resolves.toBeUndefined();
+
+    expect(sleeps).toEqual([60_000]);
+    expect(events).toMatchObject([
+      { sequence: 1, waitedMs: 0 },
+      { sequence: 2, waitedMs: 60_000 },
+      { sequence: 3, waitedMs: 0 }
+    ]);
+    expect(JSON.stringify(events)).not.toContain("first");
+    expect(JSON.stringify(events)).not.toContain("second");
+    expect(JSON.stringify(events)).not.toContain("third");
+  });
+
+  it("records minimal JSONL events without replacing the payload", async () => {
+    const root = await tempRoot();
+    const eventsPath = join(root, "provider-pacing-events.jsonl");
+    process.env[MODEL_CALL_MIN_INTERVAL_ENV] = "5";
+    process.env[MODEL_CALL_PACING_EVENTS_ENV] = eventsPath;
+    const pi = fakePi();
+    benchmarkRequestPacer(pi as never);
+
+    expect(pi.handlers).toHaveLength(1);
+    await expect(pi.handlers[0]({ type: "before_provider_request", payload: { unchanged: true } }, { signal: undefined })).resolves.toBeUndefined();
+    await expect(pi.handlers[0]({ type: "before_provider_request", payload: { unchanged: true } }, { signal: undefined })).resolves.toBeUndefined();
+
+    const events = (await readFile(eventsPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    expect(events).toHaveLength(2);
+    expect(events[0]).toMatchObject({ sequence: 1, waitedMs: 0 });
+    expect(events[1].sequence).toBe(2);
+    expect(events[1].waitedMs).toBeGreaterThanOrEqual(0);
+    expect(JSON.stringify(events)).not.toContain("unchanged");
+  });
+});
+
+function fakePi(): { handlers: Array<(event: unknown, ctx: { signal?: AbortSignal }) => Promise<unknown>>; on: (event: string, handler: (event: unknown, ctx: { signal?: AbortSignal }) => Promise<unknown>) => void } {
+  return {
+    handlers: [],
+    on(event, handler) {
+      if (event === "before_provider_request") this.handlers.push(handler);
+    }
+  };
+}
+
+async function tempRoot(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "sydes-pacer-test-"));
+  tempRoots.push(root);
+  return root;
+}

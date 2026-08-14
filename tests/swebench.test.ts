@@ -7,6 +7,7 @@ import {
   SWE_DATASET,
   SWE_MAX_OUTPUT_TOKENS,
   SWE_PI_AGENT_DIR,
+  SWE_REQUEST_PACER_EXTENSION_PATH,
   SWE_THINKING_LEVEL,
   buildGradeCommand,
   buildSwePiCommand,
@@ -21,6 +22,7 @@ import {
   type SweDeps,
   type SweRunOptions
 } from "../src/benchmark/swebench.js";
+import { MODEL_CALL_MIN_INTERVAL_ENV, MODEL_CALL_PACING_EVENTS_ENV } from "../src/benchmark/pi-request-pacer.js";
 
 const tempRoots: string[] = [];
 
@@ -87,6 +89,23 @@ describe("SWE-bench runner", () => {
     expect(sydes.args).toContain(options.extensionPath);
   });
 
+  it("loads only the benchmark pacer extension in stock when request pacing is enabled", async () => {
+    const options = await makeOptions({ modelCallMinIntervalMs: 65000 });
+    const manifest = normalizeSweRow(fixtureRow(), SWE_DATASET);
+    const stock = buildSwePiCommand({ ...options, mode: "stock" }, manifest, "/tmp/run/stock");
+    const extensionArgs = extensionValues(stock.args);
+    expect(stock.args).toContain("--no-extensions");
+    expect(extensionArgs).toEqual([SWE_REQUEST_PACER_EXTENSION_PATH]);
+    expect(extensionArgs).not.toContain(options.extensionPath);
+  });
+
+  it("loads the common pacer before Sydes when request pacing is enabled", async () => {
+    const options = await makeOptions({ modelCallMinIntervalMs: 65000 });
+    const manifest = normalizeSweRow(fixtureRow(), SWE_DATASET);
+    const sydes = buildSwePiCommand({ ...options, mode: "sydes" }, manifest, "/tmp/run/sydes");
+    expect(extensionValues(sydes.args)).toEqual([SWE_REQUEST_PACER_EXTENSION_PATH, options.extensionPath]);
+  });
+
   it("pins the same thinking level for stock and sydes", async () => {
     const options = await makeOptions();
     const manifest = normalizeSweRow(fixtureRow(), SWE_DATASET);
@@ -99,7 +118,15 @@ describe("SWE-bench runner", () => {
   });
 
   it("uses the benchmark-local Pi agent config for both stock and sydes", async () => {
-    const options = await makeOptions({ sydesIntegrationMode: "tool-middleware", env: { SYDES_INTEGRATION_MODE: "graph-guidance" } });
+    const options = await makeOptions({
+      sydesIntegrationMode: "tool-middleware",
+      modelCallMinIntervalMs: 65000,
+      env: {
+        SYDES_INTEGRATION_MODE: "graph-guidance",
+        [MODEL_CALL_MIN_INTERVAL_ENV]: "12",
+        [MODEL_CALL_PACING_EVENTS_ENV]: "/tmp/old-events.jsonl"
+      }
+    });
     const stockEnv = buildSwePiEnv({ ...options, mode: "stock" }, "/tmp/run/stock", "/tmp/run/stock/pi-sessions");
     const sydesEnv = buildSwePiEnv({ ...options, mode: "sydes" }, "/tmp/run/sydes", "/tmp/run/sydes/pi-sessions");
     expect(stockEnv.PI_CODING_AGENT_DIR).toBe(SWE_PI_AGENT_DIR);
@@ -109,6 +136,10 @@ describe("SWE-bench runner", () => {
     expect(sydesEnv.SYDES_RUN_DIR).toBe("/tmp/run/sydes");
     expect(stockEnv.SYDES_INTEGRATION_MODE).toBeUndefined();
     expect(sydesEnv.SYDES_INTEGRATION_MODE).toBe("tool-middleware");
+    expect(stockEnv[MODEL_CALL_MIN_INTERVAL_ENV]).toBe("65000");
+    expect(sydesEnv[MODEL_CALL_MIN_INTERVAL_ENV]).toBe("65000");
+    expect(stockEnv[MODEL_CALL_PACING_EVENTS_ENV]).toBe("/tmp/run/stock/provider-pacing-events.jsonl");
+    expect(sydesEnv[MODEL_CALL_PACING_EVENTS_ENV]).toBe("/tmp/run/sydes/provider-pacing-events.jsonl");
   });
 
   it("can select Sydes tool-middleware mode explicitly for benchmark runs", () => {
@@ -122,6 +153,13 @@ describe("SWE-bench runner", () => {
       "--confirm-paid-run"
     ], { HOME: "/tmp/home" });
     expect(options.sydesIntegrationMode).toBe("tool-middleware");
+  });
+
+  it("can configure benchmark provider request pacing from CLI or env", () => {
+    const cli = parseSweArgs(["--instance", "apache__druid-13704", "--mode", "stock", "--model-call-min-interval-ms", "65000"], { HOME: "/tmp/home" });
+    const env = parseSweArgs(["--instance", "apache__druid-13704", "--mode", "stock"], { HOME: "/tmp/home", [MODEL_CALL_MIN_INTERVAL_ENV]: "1234" });
+    expect(cli.modelCallMinIntervalMs).toBe(65000);
+    expect(env.modelCallMinIntervalMs).toBe(1234);
   });
 
   it("configures gpt-5-nano maxTokens in the benchmark-owned Pi models file", async () => {
@@ -232,13 +270,17 @@ describe("SWE-bench runner", () => {
       thinking: SWE_THINKING_LEVEL,
       maxTokens: SWE_MAX_OUTPUT_TOKENS,
       piAgentDir: SWE_PI_AGENT_DIR,
+      requestPacing: {
+        enabled: false,
+        minIntervalMs: 0
+      },
       finalDiffSha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     });
     expect(run.problemStatementSha256).toHaveLength(64);
   });
 
   it("records Sydes integration mode in benchmark metadata", async () => {
-    const options = await makeOptions({ mode: "sydes", dryRun: true, runId: "middleware-meta", sydesIntegrationMode: "tool-middleware" });
+    const options = await makeOptions({ mode: "sydes", dryRun: true, runId: "middleware-meta", sydesIntegrationMode: "tool-middleware", modelCallMinIntervalMs: 65000 });
     const deps = makeDeps(options);
     await runSweBench(options, deps);
     const run = JSON.parse(await readFile(join(options.artifactsRoot, options.instanceId, "middleware-meta", "sydes", "run.json"), "utf8"));
@@ -247,7 +289,11 @@ describe("SWE-bench runner", () => {
       integrationMode: "tool-middleware",
       model: DEFAULT_MODEL,
       thinking: SWE_THINKING_LEVEL,
-      maxTokens: SWE_MAX_OUTPUT_TOKENS
+      maxTokens: SWE_MAX_OUTPUT_TOKENS,
+      requestPacing: {
+        enabled: true,
+        minIntervalMs: 65000
+      }
     });
   });
 
@@ -343,12 +389,18 @@ async function makeOptions(overrides: Partial<SweRunOptions> = {}): Promise<SweR
     artifactsRoot: join(root, "artifacts"),
     piBin: "/tmp/pi",
     extensionPath: resolve("src/index.ts"),
+    requestPacerExtensionPath: SWE_REQUEST_PACER_EXTENSION_PATH,
     piAgentDir: SWE_PI_AGENT_DIR,
     cbmBin: "/tmp/cbm",
     sydesIntegrationMode: undefined,
+    modelCallMinIntervalMs: 0,
     ...overrides,
     env: { HOME: root, OPENAI_API_KEY: "set", ...(overrides.env ?? {}) }
   };
+}
+
+function extensionValues(args: string[]): string[] {
+  return args.flatMap((arg, index) => arg === "--extension" ? [args[index + 1]] : []).filter(Boolean);
 }
 
 function makeDeps(

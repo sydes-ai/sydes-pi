@@ -4,11 +4,12 @@ import type {
   ContextEvent,
   ExtensionAPI,
   ExtensionContext,
+  ToolCallEvent,
   ToolResultEvent
 } from "@earendil-works/pi-coding-agent";
 import { CbmClient } from "./cbm/client.js";
 import { findExecutable } from "./cbm/paths.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, type SydesIntegrationMode } from "./config.js";
 import { buildExplorationGuidance, buildRelevantContext, ensureProjectForRepo } from "./policy/exploration.js";
 import {
   analyzeChangeSurfaceDrift,
@@ -24,7 +25,7 @@ import {
 } from "./policy/impact.js";
 import type { AffectedContext, ChangeSurfaceDrift, RelevantContext } from "./policy/types.js";
 import type { ProjectEnsureCacheEntry } from "./policy/types.js";
-import { SydesTelemetryRecorder } from "./telemetry/recorder.js";
+import { SydesTelemetryRecorder, type ExplorationToolEvent } from "./telemetry/recorder.js";
 
 export interface SydesExtensionContext {
   registerTool?: (tool: unknown) => void;
@@ -39,6 +40,7 @@ export interface SydesExtension {
   phase: "foundation";
   cbm: CbmClient;
   policyEnabled: boolean;
+  integrationMode: SydesIntegrationMode;
   activate(context?: SydesExtensionContext): Promise<void>;
 }
 
@@ -51,6 +53,7 @@ export function createSydesExtension(): SydesExtension {
     phase: "foundation",
     cbm,
     policyEnabled: true,
+    integrationMode: config.integrationMode,
     async activate(context) {
       const cbmPath = await findExecutable(config.codebaseMemoryBin);
       if (cbmPath) {
@@ -76,7 +79,14 @@ export interface SydesRuntimeState {
   lastDriftSignature: string | null;
   projectCache: Map<string, ProjectEnsureCacheEntry>;
   impactInjectionBoundary: "context";
-  telemetry?: SydesTelemetryRecorder;
+  telemetry?: Partial<SydesTelemetryRecorder>;
+  explorationTelemetry: ExplorationTelemetryState;
+}
+
+export interface ExplorationTelemetryState {
+  sequence: number;
+  startedAt: number;
+  seenTargets: Set<string>;
 }
 
 export interface ObservedMutation {
@@ -106,7 +116,12 @@ export default function sydesPiExtension(pi: ExtensionAPI): void {
     lastReason: null,
     projectCache: new Map(),
     impactInjectionBoundary: "context",
-    telemetry: new SydesTelemetryRecorder()
+    telemetry: new SydesTelemetryRecorder(),
+    explorationTelemetry: {
+      sequence: 0,
+      startedAt: Date.now(),
+      seenTargets: new Set()
+    }
   };
 
   pi.registerCommand("sydes-status", {
@@ -230,19 +245,64 @@ export default function sydesPiExtension(pi: ExtensionAPI): void {
     }
   });
 
-  pi.on("before_agent_start", createBeforeAgentStartHandler(extension.cbm, state));
-  pi.on("tool_result", (event, ctx) => {
-    observeMutationResult(event, ctx.cwd, state);
-    observeTestResult(event, state);
-  });
-  (pi.on as (event: "context", handler: (event: ContextEvent, ctx: ExtensionContext) => Promise<{ messages?: unknown[] } | undefined>) => void)("context", async (event, ctx) => {
-    return maybeInjectPolicyGuidanceIntoContext(extension.cbm, state, ctx.cwd, event);
-  });
+  if (extension.integrationMode === "tool-middleware") {
+    pi.on("tool_call", observeExplorationToolCall);
+    pi.on("tool_result", async (event, ctx) => {
+      await recordExplorationToolResult(event, ctx.cwd, state);
+    });
+  } else {
+    pi.on("before_agent_start", createBeforeAgentStartHandler(extension.cbm, state));
+    pi.on("tool_result", (event, ctx) => {
+      observeMutationResult(event, ctx.cwd, state);
+      observeTestResult(event, state);
+    });
+    (pi.on as (event: "context", handler: (event: ContextEvent, ctx: ExtensionContext) => Promise<{ messages?: unknown[] } | undefined>) => void)("context", async (event, ctx) => {
+      return maybeInjectPolicyGuidanceIntoContext(extension.cbm, state, ctx.cwd, event);
+    });
+  }
   pi.on("session_shutdown", async () => {
-    state.telemetry?.recordCbm(extension.cbm.processStartCount, extension.cbm.transportKind);
-    await state.telemetry?.flush();
+    state.telemetry?.recordCbm?.(extension.cbm.processStartCount, extension.cbm.transportKind);
+    await state.telemetry?.flush?.();
     await extension.cbm.close();
   });
+}
+
+export function observeExplorationToolCall(event: ToolCallEvent): undefined {
+  if (!isExplorationTool(event.toolName)) {
+    return undefined;
+  }
+  return undefined;
+}
+
+export async function recordExplorationToolResult(
+  event: ToolResultEvent,
+  repoPath: string,
+  state: SydesRuntimeState,
+  now: () => number = Date.now
+): Promise<ExplorationToolEvent | null> {
+  if (!isExplorationTool(event.toolName)) {
+    return null;
+  }
+  const normalized = normalizeExplorationTarget(event.toolName, event.input, repoPath);
+  const repeatKey = normalized.normalizedTarget ?? normalized.normalizedQuery ?? JSON.stringify(safeExplorationInput(event.toolName, event.input));
+  const repeated = state.explorationTelemetry.seenTargets.has(repeatKey);
+  state.explorationTelemetry.seenTargets.add(repeatKey);
+  const timestampMs = now();
+  const explorationEvent: ExplorationToolEvent = {
+    sequence: ++state.explorationTelemetry.sequence,
+    toolName: event.toolName,
+    toolCallId: event.toolCallId,
+    input: safeExplorationInput(event.toolName, event.input),
+    normalizedTarget: normalized.normalizedTarget,
+    normalizedQuery: normalized.normalizedQuery,
+    repeated,
+    timestamp: new Date(timestampMs).toISOString(),
+    elapsedMs: Math.max(0, timestampMs - state.explorationTelemetry.startedAt),
+    resultSizeBytes: safeResultSize(event.content),
+    isError: event.isError
+  };
+  await state.telemetry?.recordExplorationToolEvent?.(explorationEvent);
+  return explorationEvent;
 }
 
 export function createBeforeAgentStartHandler(cbm: CbmClient, state: SydesRuntimeState) {
@@ -267,7 +327,7 @@ export function createBeforeAgentStartHandler(cbm: CbmClient, state: SydesRuntim
     const guidance = buildExplorationGuidance(context);
     state.lastContext = context;
     state.lastReason = null;
-    state.telemetry?.recordExploration(context, guidance);
+    state.telemetry?.recordExploration?.(context, guidance);
     return {
       message: {
         customType: "sydes-graph-guidance",
@@ -415,7 +475,7 @@ export async function maybeInjectPolicyGuidanceIntoContext(
     state.lastDrift = drift;
     const injected = shouldInjectDriftWarning(drift, state.lastDriftSignature);
     const guidance = buildChangeSurfaceGuidance(drift);
-    state.telemetry?.recordDrift(drift, guidance, {
+    state.telemetry?.recordDrift?.(drift, guidance, {
       injectionHook: "context",
       injected,
       injectedBeforeNextModelTurn: injected
@@ -463,6 +523,70 @@ export async function buildCurrentDrift(
   });
 }
 
+function isExplorationTool(toolName: string): toolName is "read" | "grep" | "find" {
+  return toolName === "read" || toolName === "grep" || toolName === "find";
+}
+
+function normalizeExplorationTarget(
+  toolName: string,
+  input: Record<string, unknown>,
+  repoPath: string
+): { normalizedTarget?: string; normalizedQuery?: string } {
+  if (toolName === "read") {
+    return { normalizedTarget: normalizeImpactPath(repoPath, stringInput(input, "path")) ?? undefined };
+  }
+  if (toolName === "grep") {
+    return {
+      normalizedTarget: normalizeImpactPath(repoPath, stringInput(input, "path")) ?? undefined,
+      normalizedQuery: stringInput(input, "pattern") ?? stringInput(input, "query") ?? undefined
+    };
+  }
+  if (toolName === "find") {
+    return {
+      normalizedTarget: normalizeImpactPath(repoPath, stringInput(input, "path")) ?? undefined,
+      normalizedQuery: stringInput(input, "pattern") ?? undefined
+    };
+  }
+  return {};
+}
+
+function safeExplorationInput(toolName: string, input: Record<string, unknown>): Record<string, unknown> {
+  if (toolName === "read") {
+    return pickInput(input, ["path", "offset", "limit"]);
+  }
+  if (toolName === "grep") {
+    return pickInput(input, ["pattern", "query", "path", "include", "limit"]);
+  }
+  if (toolName === "find") {
+    return pickInput(input, ["pattern", "path", "limit"]);
+  }
+  return {};
+}
+
+function pickInput(input: Record<string, unknown>, keys: string[]): Record<string, unknown> {
+  const picked: Record<string, unknown> = {};
+  for (const key of keys) {
+    const value = input[key];
+    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+      picked[key] = value;
+    }
+  }
+  return picked;
+}
+
+function stringInput(input: Record<string, unknown>, key: string): string | undefined {
+  const value = input[key];
+  return typeof value === "string" && value ? value : undefined;
+}
+
+function safeResultSize(content: unknown): number {
+  try {
+    return Buffer.byteLength(JSON.stringify(content ?? []), "utf8");
+  } catch {
+    return 0;
+  }
+}
+
 async function buildPendingImpactGuidance(
   cbm: CbmClient,
   state: SydesRuntimeState,
@@ -504,7 +628,7 @@ async function buildPendingImpactGuidance(
   state.lastReason = null;
   const guidance = buildImpactGuidance(affected);
   if (hasRelevantTestAfterLastMutation(affected, testsAfterMutation)) {
-    state.telemetry?.recordImpactSuppressed(affected, guidance, injectionHook);
+    state.telemetry?.recordImpactSuppressed?.(affected, guidance, injectionHook);
     return {
       message: {
         customType: "sydes-impact-guidance",
@@ -516,7 +640,7 @@ async function buildPendingImpactGuidance(
     };
   }
 
-  state.telemetry?.recordImpact(affected, guidance, {
+  state.telemetry?.recordImpact?.(affected, guidance, {
     injectionHook,
     injectedBeforeNextModelTurn: injectionHook === "context"
   });

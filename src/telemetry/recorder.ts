@@ -1,9 +1,24 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { AffectedContext, ChangeSurfaceDrift, RelevantContext } from "../policy/types.js";
 
+export interface ExplorationToolEvent {
+  sequence: number;
+  toolName: string;
+  toolCallId: string;
+  input: Record<string, unknown>;
+  normalizedTarget?: string;
+  normalizedQuery?: string;
+  repeated: boolean;
+  timestamp: string;
+  elapsedMs: number;
+  resultSizeBytes: number;
+  isError: boolean;
+}
+
 export interface SydesTelemetry {
   explorationGuidanceInjected: boolean;
+  explorationToolEventCount: number;
   explorationGuidanceText?: string;
   explorationContext?: {
     entryPoints: unknown[];
@@ -62,6 +77,7 @@ export class SydesTelemetryRecorder {
   private readonly runDir: string | undefined;
   private data: SydesTelemetry = {
     explorationGuidanceInjected: false,
+    explorationToolEventCount: 0,
     impactGuidanceCount: 0,
     impactGuidanceEvents: [],
     driftAnalysisCount: 0,
@@ -75,6 +91,16 @@ export class SydesTelemetryRecorder {
 
   get enabled(): boolean {
     return !!this.runDir;
+  }
+
+  async recordExplorationToolEvent(event: ExplorationToolEvent): Promise<void> {
+    this.data.explorationToolEventCount += 1;
+    if (!this.runDir) {
+      return;
+    }
+    await mkdir(this.runDir, { recursive: true });
+    await appendFile(join(this.runDir, "exploration-events.jsonl"), `${JSON.stringify(event)}\n`);
+    await this.flush();
   }
 
   recordExploration(context: RelevantContext, guidanceText: string): void {

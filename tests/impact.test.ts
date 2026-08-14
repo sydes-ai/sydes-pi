@@ -78,7 +78,12 @@ function makeState(): SydesRuntimeState {
     impactInjectionBoundary: "context",
     lastImpactSignature: null,
     lastDrift: null,
-    lastDriftSignature: null
+    lastDriftSignature: null,
+    explorationTelemetry: {
+      sequence: 0,
+      startedAt: 0,
+      seenTargets: new Set()
+    }
   };
 }
 

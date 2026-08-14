@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { createBeforeAgentStartHandler, shouldInjectForPrompt } from "../src/extension.js";
+import { createBeforeAgentStartHandler, recordExplorationToolResult, shouldInjectForPrompt, type SydesRuntimeState } from "../src/extension.js";
 import {
   buildExplorationGuidance,
   buildRelevantContext,
@@ -18,6 +18,7 @@ import {
   resolveCbmProject
 } from "../src/policy/exploration.js";
 import type { PolicyCbmClient, RelevantContext, RelevantSymbol } from "../src/policy/types.js";
+import type { ToolResultEvent } from "@earendil-works/pi-coding-agent";
 
 const execFileAsync = promisify(execFile);
 const repoPath = "/tmp/pokemon-api";
@@ -381,9 +382,137 @@ describe("Phase 1 exploration policy", () => {
     expect(pi.on).toHaveBeenCalledWith("before_agent_start", expect.any(Function));
     expect(pi.registerTool).not.toHaveBeenCalled();
   });
+
+  it("tool-middleware mode disables startup exploration guidance and context injection hooks", async () => {
+    const mod = await import("../src/index.js");
+    const previous = process.env.SYDES_INTEGRATION_MODE;
+    process.env.SYDES_INTEGRATION_MODE = "tool-middleware";
+    try {
+      const pi = {
+        registerCommand: vi.fn(),
+        on: vi.fn(),
+        registerTool: vi.fn()
+      };
+      mod.default(pi as never);
+      expect(pi.on).not.toHaveBeenCalledWith("before_agent_start", expect.any(Function));
+      expect(pi.on).not.toHaveBeenCalledWith("context", expect.any(Function));
+      expect(pi.on).toHaveBeenCalledWith("tool_call", expect.any(Function));
+      expect(pi.on).toHaveBeenCalledWith("tool_result", expect.any(Function));
+      expect(pi.registerTool).not.toHaveBeenCalled();
+    } finally {
+      if (previous === undefined) {
+        delete process.env.SYDES_INTEGRATION_MODE;
+      } else {
+        process.env.SYDES_INTEGRATION_MODE = previous;
+      }
+    }
+  });
+
+  it("tool-middleware leaves the original task prompt path unchanged", async () => {
+    const mod = await import("../src/index.js");
+    const previous = process.env.SYDES_INTEGRATION_MODE;
+    process.env.SYDES_INTEGRATION_MODE = "tool-middleware";
+    try {
+      const pi = {
+        registerCommand: vi.fn(),
+        on: vi.fn(),
+        registerTool: vi.fn()
+      };
+      mod.default(pi as never);
+      const beforeAgentStart = vi.mocked(pi.on).mock.calls.find((call) => call[0] === "before_agent_start");
+      expect(beforeAgentStart).toBeUndefined();
+    } finally {
+      if (previous === undefined) {
+        delete process.env.SYDES_INTEGRATION_MODE;
+      } else {
+        process.env.SYDES_INTEGRATION_MODE = previous;
+      }
+    }
+  });
+
+  it("records read exploration events and repeated reads without changing tool output", async () => {
+    const state = makeState();
+    const originalContent = [{ type: "text", text: "package main" }];
+    const event = {
+      type: "tool_result",
+      toolName: "read",
+      toolCallId: "read-1",
+      input: { path: "/tmp/pokemon-api/pkg/handler/pokedex.go" },
+      content: originalContent,
+      details: undefined,
+      isError: false
+    } as ToolResultEvent;
+
+    const first = await recordExplorationToolResult(event, repoPath, state, () => 1100);
+    const second = await recordExplorationToolResult({ ...event, toolCallId: "read-2" } as ToolResultEvent, repoPath, state, () => 1200);
+
+    expect(first).toMatchObject({
+      sequence: 1,
+      toolName: "read",
+      normalizedTarget: "pkg/handler/pokedex.go",
+      repeated: false,
+      resultSizeBytes: JSON.stringify(originalContent).length,
+      isError: false
+    });
+    expect(second?.repeated).toBe(true);
+    expect(event.content).toBe(originalContent);
+    expect(state.telemetry?.recordExplorationToolEvent).toHaveBeenCalledTimes(2);
+  });
+
+  it("records grep and find exploration events", async () => {
+    const state = makeState();
+    const grep = await recordExplorationToolResult({
+      type: "tool_result",
+      toolName: "grep",
+      toolCallId: "grep-1",
+      input: { pattern: "AddPokemon", path: "/tmp/pokemon-api/pkg" },
+      content: [{ type: "text", text: "pkg/handler/pokedex.go" }],
+      details: undefined,
+      isError: false
+    } as never, repoPath, state, () => 1100);
+    const find = await recordExplorationToolResult({
+      type: "tool_result",
+      toolName: "find",
+      toolCallId: "find-1",
+      input: { pattern: "*.go", path: "/tmp/pokemon-api" },
+      content: [{ type: "text", text: "pkg/handler/pokedex.go" }],
+      details: undefined,
+      isError: false
+    } as never, repoPath, state, () => 1200);
+
+    expect(grep).toMatchObject({ toolName: "grep", normalizedTarget: "pkg", normalizedQuery: "AddPokemon" });
+    expect(find).toMatchObject({ toolName: "find", normalizedQuery: "*.go" });
+    expect(find?.normalizedTarget).toBeUndefined();
+  });
+
+  it("does not query CBM because of intercepted read or search results", async () => {
+    const state = makeState();
+    const client = makeClient();
+    await recordExplorationToolResult({
+      type: "tool_result",
+      toolName: "read",
+      toolCallId: "read-1",
+      input: { path: "/tmp/pokemon-api/pkg/handler/pokedex.go" },
+      content: [{ type: "text", text: "ok" }],
+      details: undefined,
+      isError: false
+    } as never, repoPath, state);
+    await recordExplorationToolResult({
+      type: "tool_result",
+      toolName: "grep",
+      toolCallId: "grep-1",
+      input: { pattern: "AddPokemon" },
+      content: [{ type: "text", text: "ok" }],
+      details: undefined,
+      isError: false
+    } as never, repoPath, state);
+    expect(client.listProjects).not.toHaveBeenCalled();
+    expect(client.searchGraphByArgs).not.toHaveBeenCalled();
+    expect(client.tracePath).not.toHaveBeenCalled();
+  });
 });
 
-function makeState() {
+function makeState(): SydesRuntimeState {
   return {
     lastContext: null,
     lastAffectedContext: null,
@@ -395,7 +524,15 @@ function makeState() {
     impactInjectionBoundary: "context" as const,
     lastImpactSignature: null,
     lastDrift: null,
-    lastDriftSignature: null
+    lastDriftSignature: null,
+    explorationTelemetry: {
+      sequence: 0,
+      startedAt: 1000,
+      seenTargets: new Set<string>()
+    },
+    telemetry: {
+      recordExplorationToolEvent: vi.fn(async () => undefined)
+    }
   };
 }
 

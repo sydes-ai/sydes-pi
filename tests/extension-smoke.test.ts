@@ -18,4 +18,18 @@ describe("createSydesExtension", () => {
       } as never)
     ).not.toThrow();
   });
+
+  it("enables tool-middleware mode from SYDES_INTEGRATION_MODE", () => {
+    const previous = process.env.SYDES_INTEGRATION_MODE;
+    process.env.SYDES_INTEGRATION_MODE = "tool-middleware";
+    try {
+      expect(createSydesExtension().integrationMode).toBe("tool-middleware");
+    } finally {
+      if (previous === undefined) {
+        delete process.env.SYDES_INTEGRATION_MODE;
+      } else {
+        process.env.SYDES_INTEGRATION_MODE = previous;
+      }
+    }
+  });
 });

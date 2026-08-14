@@ -15,11 +15,12 @@ export {
   default,
   maybeSendImpactGuidance,
   observeMutationResult,
+  recordExplorationToolResult,
   renderDebugContext,
   renderImpactDebugContext,
   shouldInjectForPrompt
 } from "./extension.js";
-export type { ObservedMutation, SydesExtension, SydesExtensionContext, SydesRuntimeState } from "./extension.js";
+export type { ExplorationTelemetryState, ObservedMutation, SydesExtension, SydesExtensionContext, SydesRuntimeState } from "./extension.js";
 export {
   buildAffectedContext,
   buildImpactGuidance,

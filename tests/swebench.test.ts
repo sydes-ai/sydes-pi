@@ -99,7 +99,7 @@ describe("SWE-bench runner", () => {
   });
 
   it("uses the benchmark-local Pi agent config for both stock and sydes", async () => {
-    const options = await makeOptions();
+    const options = await makeOptions({ sydesIntegrationMode: "tool-middleware", env: { SYDES_INTEGRATION_MODE: "graph-guidance" } });
     const stockEnv = buildSwePiEnv({ ...options, mode: "stock" }, "/tmp/run/stock", "/tmp/run/stock/pi-sessions");
     const sydesEnv = buildSwePiEnv({ ...options, mode: "sydes" }, "/tmp/run/sydes", "/tmp/run/sydes/pi-sessions");
     expect(stockEnv.PI_CODING_AGENT_DIR).toBe(SWE_PI_AGENT_DIR);
@@ -107,6 +107,21 @@ describe("SWE-bench runner", () => {
     expect(stockEnv.PI_CODING_AGENT_DIR).toBe(sydesEnv.PI_CODING_AGENT_DIR);
     expect(stockEnv.SYDES_RUN_DIR).toBe("");
     expect(sydesEnv.SYDES_RUN_DIR).toBe("/tmp/run/sydes");
+    expect(stockEnv.SYDES_INTEGRATION_MODE).toBeUndefined();
+    expect(sydesEnv.SYDES_INTEGRATION_MODE).toBe("tool-middleware");
+  });
+
+  it("can select Sydes tool-middleware mode explicitly for benchmark runs", () => {
+    const options = parseSweArgs([
+      "--instance",
+      "apache__druid-13704",
+      "--mode",
+      "sydes",
+      "--sydes-integration-mode",
+      "tool-middleware",
+      "--confirm-paid-run"
+    ], { HOME: "/tmp/home" });
+    expect(options.sydesIntegrationMode).toBe("tool-middleware");
   });
 
   it("configures gpt-5-nano maxTokens in the benchmark-owned Pi models file", async () => {
@@ -222,6 +237,20 @@ describe("SWE-bench runner", () => {
     expect(run.problemStatementSha256).toHaveLength(64);
   });
 
+  it("records Sydes integration mode in benchmark metadata", async () => {
+    const options = await makeOptions({ mode: "sydes", dryRun: true, runId: "middleware-meta", sydesIntegrationMode: "tool-middleware" });
+    const deps = makeDeps(options);
+    await runSweBench(options, deps);
+    const run = JSON.parse(await readFile(join(options.artifactsRoot, options.instanceId, "middleware-meta", "sydes", "run.json"), "utf8"));
+    expect(run).toMatchObject({
+      mode: "sydes",
+      integrationMode: "tool-middleware",
+      model: DEFAULT_MODEL,
+      thinking: SWE_THINKING_LEVEL,
+      maxTokens: SWE_MAX_OUTPUT_TOKENS
+    });
+  });
+
   it("prints model, thinking, and max output tokens in dry-run output", async () => {
     const options = await makeOptions({ dryRun: true, runId: "dry-output" });
     const deps = makeDeps(options);
@@ -316,6 +345,7 @@ async function makeOptions(overrides: Partial<SweRunOptions> = {}): Promise<SweR
     extensionPath: resolve("src/index.ts"),
     piAgentDir: SWE_PI_AGENT_DIR,
     cbmBin: "/tmp/cbm",
+    sydesIntegrationMode: undefined,
     ...overrides,
     env: { HOME: root, OPENAI_API_KEY: "set", ...(overrides.env ?? {}) }
   };

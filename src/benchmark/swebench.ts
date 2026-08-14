@@ -8,6 +8,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { CbmClient } from "../cbm/client.js";
+import type { SydesIntegrationMode } from "../config.js";
 import { buildRelevantContext, ensureProjectForRepo } from "../policy/exploration.js";
 import { analyzeSession } from "../telemetry/session-analyzer.js";
 
@@ -48,6 +49,7 @@ export interface SweRunOptions {
   extensionPath: string;
   piAgentDir: string;
   cbmBin: string;
+  sydesIntegrationMode?: SydesIntegrationMode;
   env: NodeJS.ProcessEnv;
 }
 
@@ -73,6 +75,7 @@ export function parseSweArgs(argv: string[], env: NodeJS.ProcessEnv = process.en
     extensionPath: resolve("src/index.ts"),
     piAgentDir: SWE_PI_AGENT_DIR,
     cbmBin: resolve("node_modules/.bin/codebase-memory-mcp"),
+    sydesIntegrationMode: parseSydesIntegrationMode(valueAfter(argv, "--sydes-integration-mode") ?? valueWithPrefix(argv, "--sydes-integration-mode=")),
     env
   };
 }
@@ -146,11 +149,14 @@ export function buildSwePiCommand(options: SweRunOptions, manifest: SweManifest,
 }
 
 export function buildSwePiEnv(options: SweRunOptions, modeDir: string, sessionDir: string): NodeJS.ProcessEnv {
+  const { SYDES_INTEGRATION_MODE: _discarded, ...baseEnv } = options.env;
+  const sydesIntegrationMode = options.sydesIntegrationMode ?? options.env.SYDES_INTEGRATION_MODE;
   return {
-    ...options.env,
+    ...baseEnv,
     PI_CODING_AGENT_DIR: options.piAgentDir,
     SYDES_RUN_DIR: options.mode === "sydes" ? modeDir : "",
-    PI_CODING_AGENT_SESSION_DIR: sessionDir
+    PI_CODING_AGENT_SESSION_DIR: sessionDir,
+    ...(options.mode === "sydes" && sydesIntegrationMode ? { SYDES_INTEGRATION_MODE: sydesIntegrationMode } : {})
   };
 }
 
@@ -190,6 +196,7 @@ export async function runSweBench(options: SweRunOptions, deps: SweDeps = defaul
       model: options.model,
       thinking: SWE_THINKING_LEVEL,
       maxTokens: SWE_MAX_OUTPUT_TOKENS,
+      integrationMode: options.mode === "sydes" ? options.sydesIntegrationMode ?? null : null,
       piAgentDir: options.piAgentDir,
       worktree,
       repoUrl,
@@ -253,6 +260,7 @@ export async function runSweBench(options: SweRunOptions, deps: SweDeps = defaul
         model: options.model,
         thinking: SWE_THINKING_LEVEL,
         maxTokens: SWE_MAX_OUTPUT_TOKENS,
+        integrationMode: options.mode === "sydes" ? options.sydesIntegrationMode ?? null : null,
         piAgentDir: options.piAgentDir,
         worktree,
         repoUrl,
@@ -285,6 +293,7 @@ export async function runSweBench(options: SweRunOptions, deps: SweDeps = defaul
       model: options.model,
       thinking: SWE_THINKING_LEVEL,
       maxTokens: SWE_MAX_OUTPUT_TOKENS,
+      integrationMode: options.mode === "sydes" ? options.sydesIntegrationMode ?? null : null,
       piAgentDir: options.piAgentDir,
       worktree,
       repoUrl,
@@ -517,6 +526,12 @@ function repoFolderName(repo: string): string {
 function parseMode(mode: string): SweMode {
   if (mode === "stock" || mode === "sydes") return mode;
   return "" as SweMode;
+}
+
+function parseSydesIntegrationMode(value: string | undefined): SydesIntegrationMode | undefined {
+  if (value === undefined) return undefined;
+  if (value === "graph-guidance" || value === "tool-middleware") return value;
+  throw new Error("--sydes-integration-mode must be graph-guidance or tool-middleware");
 }
 
 function stringField(row: Record<string, unknown>, key: string): string {

@@ -61,11 +61,13 @@ export function createProviderCallBudget(
   maxProviderCalls: number,
   next: (event: unknown, ctx: { signal?: AbortSignal }) => Promise<void>,
   deps: Pick<ProviderRequestPacerDeps, "now" | "writeEvent">
-): (event: unknown, ctx: { signal?: AbortSignal }) => Promise<void> {
+): (event: unknown, ctx: { signal?: AbortSignal; abort?: () => void }) => Promise<void> {
+  if (maxProviderCalls <= 0) return next;
   let requestsStarted = 0;
+  let exhausted = false;
   return async (event, ctx) => {
     if (requestsStarted >= maxProviderCalls) {
-      if (deps.writeEvent) {
+      if (!exhausted && deps.writeEvent) {
         await deps.writeEvent({
           sequence: requestsStarted + 1,
           timestamp: new Date(deps.now()).toISOString(),
@@ -80,7 +82,9 @@ export function createProviderCallBudget(
           terminationReason: PROVIDER_CALL_BUDGET_EXHAUSTED
         });
       }
-      throw new Error(PROVIDER_CALL_BUDGET_EXHAUSTED);
+      exhausted = true;
+      ctx.abort?.();
+      return;
     }
     requestsStarted += 1;
     await next(event, ctx);

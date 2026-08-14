@@ -264,6 +264,7 @@ describe("benchmark Pi request pacer", () => {
 
   it("blocks request after the configured provider call budget", async () => {
     let nextCalls = 0;
+    let abortCalls = 0;
     const events: unknown[] = [];
     const handler = createProviderCallBudget(2, async () => {
       nextCalls += 1;
@@ -274,9 +275,10 @@ describe("benchmark Pi request pacer", () => {
 
     await handler(providerPayload("one"), {});
     await handler(providerPayload("two"), {});
-    await expect(handler(providerPayload("three"), {})).rejects.toThrow("provider_call_budget_exhausted");
+    await expect(handler(providerPayload("three"), { abort: () => { abortCalls += 1; } })).resolves.toBeUndefined();
 
     expect(nextCalls).toBe(2);
+    expect(abortCalls).toBe(1);
     expect(events).toMatchObject([
       {
         sequence: 3,
@@ -290,9 +292,40 @@ describe("benchmark Pi request pacer", () => {
     expect(JSON.stringify(events)).not.toContain("three");
   });
 
+  it("records only one exhaustion event for repeated blocked attempts", async () => {
+    let nextCalls = 0;
+    let abortCalls = 0;
+    const events: unknown[] = [];
+    const handler = createProviderCallBudget(1, async () => {
+      nextCalls += 1;
+    }, {
+      now: () => 99_000,
+      writeEvent: async (event) => { events.push(event); }
+    });
+
+    await handler(providerPayload("one"), {});
+    await handler(providerPayload("two"), { abort: () => { abortCalls += 1; } });
+    await handler(providerPayload("three"), { abort: () => { abortCalls += 1; } });
+    await handler(providerPayload("four"), { abort: () => { abortCalls += 1; } });
+
+    expect(nextCalls).toBe(1);
+    expect(abortCalls).toBe(3);
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      sequence: 2,
+      providerCallsStarted: 1,
+      providerCallBudgetExhausted: true,
+      terminationReason: "provider_call_budget_exhausted"
+    });
+    expect(JSON.stringify(events)).not.toContain("two");
+    expect(JSON.stringify(events)).not.toContain("three");
+    expect(JSON.stringify(events)).not.toContain("four");
+  });
+
   it("does not invoke TPM sleep for a request blocked by provider call budget", async () => {
     let nextCalls = 0;
     let sleepCalls = 0;
+    let abortCalls = 0;
     const pacer = createRollingTpmPacer(10, {
       now: () => 0,
       sleep: async () => {
@@ -300,14 +333,16 @@ describe("benchmark Pi request pacer", () => {
       },
       estimateTokens: () => 20
     });
-    const handler = createProviderCallBudget(0, async (event, ctx) => {
+    const handler = createProviderCallBudget(1, async (event, ctx) => {
       nextCalls += 1;
       await pacer(event, ctx);
     }, { now: () => 0 });
 
-    await expect(handler(providerPayload("blocked"), {})).rejects.toThrow("provider_call_budget_exhausted");
+    await expect(handler(providerPayload("allowed"), {})).resolves.toBeUndefined();
+    await expect(handler(providerPayload("blocked"), { abort: () => { abortCalls += 1; } })).resolves.toBeUndefined();
 
-    expect(nextCalls).toBe(0);
+    expect(nextCalls).toBe(1);
+    expect(abortCalls).toBe(1);
     expect(sleepCalls).toBe(0);
   });
 
@@ -321,7 +356,7 @@ describe("benchmark Pi request pacer", () => {
 
     expect(pi.handlers).toHaveLength(1);
     await expect(pi.handlers[0](providerPayload("allowed"), { signal: undefined })).resolves.toBeUndefined();
-    await expect(pi.handlers[0](providerPayload("blocked"), { signal: undefined })).rejects.toThrow("provider_call_budget_exhausted");
+    await expect(pi.handlers[0](providerPayload("blocked"), { signal: undefined })).resolves.toBeUndefined();
 
     const events = (await readFile(eventsPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
     expect(events.at(-1)).toMatchObject({
